@@ -16,4 +16,4 @@ pi -e git:github.com/YukiagoTpf/yuki-pi
 
 ## Contents
 
-- `.pi/extensions/btw.ts` — `/btw` one-shot side-question command.
+- `extensions/btw.ts` — `/btw` one-shot side-question command.
