@@ -17,3 +17,10 @@ pi -e git:github.com/YukiagoTpf/yuki-pi
 ## Contents
 
 - `extensions/btw.ts` — `/btw` one-shot side-question command.
+- `extensions/recap.ts` — `/recap` one-sentence session progress recap.
+
+## Recap
+
+Use `/recap` to generate a one-sentence summary of what the current coding session is working on and where it stands.
+It uses the currently selected Pi model with low reasoning and shows the result in a transient overlay.
+Press Enter or Esc to close the recap overlay.
