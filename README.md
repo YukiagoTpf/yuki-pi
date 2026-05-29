@@ -23,4 +23,5 @@ pi -e git:github.com/YukiagoTpf/yuki-pi
 
 Use `/recap` to generate a one-sentence summary of what the current coding session is working on and where it stands.
 It uses the currently selected Pi model with low reasoning and shows the result in a transient overlay.
-Press Enter or Esc to close the recap overlay.
+After 10 minutes without a new completed turn, it also generates the same one-sentence recap automatically in a dismissible widget above the editor.
+Press Space, Enter, or Esc to dismiss the automatic widget.

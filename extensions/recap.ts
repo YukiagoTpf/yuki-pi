@@ -2,6 +2,8 @@
  * /recap - one-sentence progress recap for Pi.
  *
  * Manual: `/recap` renders a transient overlay.
+ * Auto: after 10 minutes without a new turn_end, silently generates a recap
+ * and renders a dismissible widget above the editor.
  */
 
 import { complete, type UserMessage } from "@earendil-works/pi-ai";
@@ -12,6 +14,8 @@ import { Key, matchesKey, type Component, truncateToWidth, visibleWidth, wrapTex
 const RECAP_CUSTOM_TYPE = "recap";
 const TAIL_BUDGET_CHARS = 8_000;
 const MIN_TRANSCRIPT_CHARS = 200;
+const IDLE_MS = 10 * 60 * 1000;
+const MAX_WIDGET_LINES = 10;
 
 const SYSTEM_PROMPT = `Summarize this coding session in ONE sentence: what the user is working on and the current progress.
 
@@ -19,6 +23,8 @@ Rules:
 - Output the sentence only — no preface, quotes, or markdown.
 - ≤ 30 Chinese chars or ≤ 25 English words.
 - Match the language of the latest user message.`;
+
+type RecapMode = "manual" | "auto";
 
 type BranchEntry = ReturnType<ExtensionContext["sessionManager"]["getBranch"]>[number];
 
@@ -28,7 +34,80 @@ type RecapTranscript = {
 };
 
 export default function recapExtension(pi: ExtensionAPI) {
+	let lastActivityAt = Date.now();
+	let alreadyFired = false;
+	let idleTimer: ReturnType<typeof setTimeout> | null = null;
 	let inflight: Promise<void> | null = null;
+	let clearDismissHandler: (() => void) | undefined;
+	let autoAbortController: AbortController | undefined;
+	let disposed = false;
+	let activityVersion = 0;
+
+	const clearRecapWidget = (ctx: Pick<ExtensionContext, "ui">) => {
+		ctx.ui.setWidget(RECAP_CUSTOM_TYPE, undefined);
+		ctx.ui.setStatus(RECAP_CUSTOM_TYPE, undefined);
+		clearDismissHandler?.();
+		clearDismissHandler = undefined;
+	};
+
+	const installDismissHandler = (ctx: ExtensionContext) => {
+		clearDismissHandler?.();
+		clearDismissHandler = ctx.ui.onTerminalInput((data) => {
+			if (matchesKey(data, Key.escape) || matchesKey(data, Key.enter) || matchesKey(data, Key.space) || data === " ") {
+				clearRecapWidget(ctx);
+				return { consume: true };
+			}
+			return undefined;
+		});
+	};
+
+	const clearIdleTimer = () => {
+		if (idleTimer) {
+			clearTimeout(idleTimer);
+			idleTimer = null;
+		}
+	};
+
+	const scheduleIdleTimer = (ctx: ExtensionContext) => {
+		clearIdleTimer();
+		idleTimer = setTimeout(() => {
+			idleTimer = null;
+			if (disposed || alreadyFired) return;
+			if (Date.now() - lastActivityAt < IDLE_MS) return;
+			void startRecap("auto", ctx);
+		}, IDLE_MS);
+		(idleTimer as unknown as { unref?: () => void }).unref?.();
+	};
+
+	const startRecap = (mode: RecapMode, ctx: ExtensionContext): Promise<void> | undefined => {
+		if (inflight) {
+			if (mode === "manual" && ctx.hasUI) {
+				ctx.ui.notify("Recap already in progress", "info");
+			}
+			return undefined;
+		}
+
+		if (mode === "manual" && ctx.hasUI) {
+			clearRecapWidget(ctx);
+		}
+
+		autoAbortController = mode === "auto" ? new AbortController() : undefined;
+		const signal = mode === "auto" ? autoAbortController.signal : ctx.signal;
+		const recapActivityVersion = activityVersion;
+
+		inflight = (async () => {
+			try {
+				await runRecap(mode, ctx, signal, recapActivityVersion);
+			} finally {
+				inflight = null;
+				if (mode === "auto") {
+					autoAbortController = undefined;
+				}
+			}
+		})();
+
+		return inflight;
+	};
 
 	pi.on("context", (event) => ({
 		messages: event.messages.filter(
@@ -36,44 +115,80 @@ export default function recapExtension(pi: ExtensionAPI) {
 		),
 	}));
 
+	pi.on("turn_end", (_event, ctx) => {
+		lastActivityAt = Date.now();
+		activityVersion += 1;
+		alreadyFired = false;
+		disposed = false;
+		scheduleIdleTimer(ctx);
+	});
+
+	pi.on("session_shutdown", (_event, ctx) => {
+		disposed = true;
+		clearIdleTimer();
+		autoAbortController?.abort();
+		autoAbortController = undefined;
+		alreadyFired = false;
+		inflight = null;
+		try {
+			clearRecapWidget(ctx);
+		} catch {
+			// Runtime may already be tearing down; best-effort cleanup only.
+		}
+	});
+
 	pi.registerCommand("recap", {
 		description: "Summarize the current coding session in one sentence",
 		handler: async (_args, ctx) => {
-			if (inflight) {
-				if (ctx.hasUI) ctx.ui.notify("Recap already in progress", "info");
-				return;
-			}
-
-			inflight = runManualRecap(ctx).finally(() => {
-				inflight = null;
-			});
-			await inflight;
+			await startRecap("manual", ctx);
 		},
 	});
-}
 
-async function runManualRecap(ctx: ExtensionContext): Promise<void> {
-	if (!ctx.model) {
-		if (ctx.hasUI) ctx.ui.notify("Recap requires a selected model", "error");
-		return;
-	}
+	async function runRecap(
+		mode: RecapMode,
+		ctx: ExtensionContext,
+		signal: AbortSignal | undefined,
+		recapActivityVersion: number,
+	): Promise<void> {
+		const manual = mode === "manual";
 
-	const transcript = buildTranscript(ctx);
-	if (transcript.conversationMessageCount < 2 || transcript.text.trim().length < MIN_TRANSCRIPT_CHARS) {
-		if (ctx.hasUI) ctx.ui.notify("Nothing to recap yet", "info");
-		return;
-	}
+		if (!ctx.model) {
+			if (manual && ctx.hasUI) ctx.ui.notify("Recap requires a selected model", "error");
+			return;
+		}
 
-	if (!ctx.hasUI) return;
+		const transcript = buildTranscript(ctx);
+		if (transcript.conversationMessageCount < 2 || transcript.text.trim().length < MIN_TRANSCRIPT_CHARS) {
+			if (manual && ctx.hasUI) ctx.ui.notify("Nothing to recap yet", "info");
+			return;
+		}
 
-	try {
-		const summary = await generateRecap(transcript.text, ctx, ctx.signal);
-		if (isAborted(ctx.signal)) return;
-		await showRecapOverlay(summary, ctx);
-	} catch (error) {
-		if (isAbortError(error) || isAborted(ctx.signal)) return;
-		const message = error instanceof Error ? error.message : String(error);
-		await showRecapOverlay(`Error: ${message}`, ctx);
+		if (!ctx.hasUI && manual) {
+			return;
+		}
+
+		try {
+			const summary = await generateRecap(transcript.text, ctx, signal);
+			if (disposed || isAborted(signal)) return;
+
+			if (manual) {
+				if (ctx.hasUI) await showRecapOverlay(summary, ctx);
+			} else {
+				if (activityVersion !== recapActivityVersion || disposed || !ctx.hasUI) return;
+				alreadyFired = true;
+				ctx.ui.setWidget(RECAP_CUSTOM_TYPE, createRecapCard(summary), { placement: "aboveEditor" });
+				ctx.ui.setStatus(RECAP_CUSTOM_TYPE, ctx.ui.theme.fg("accent", "Recap ready"));
+				installDismissHandler(ctx);
+			}
+		} catch (error) {
+			if (isAbortError(error) || isAborted(signal)) return;
+			if (disposed) return;
+			const message = error instanceof Error ? error.message : String(error);
+			if (manual && ctx.hasUI) {
+				await showRecapOverlay(`Error: ${message}`, ctx);
+			}
+			// Auto mode intentionally swallows recap errors.
+		}
 	}
 }
 
@@ -254,6 +369,55 @@ class OverlayCard implements Component {
 			this.done();
 		}
 	}
+
+	invalidate(): void {}
+
+	private frameLine(line: string, innerWidth: number): string {
+		const padded = line + " ".repeat(Math.max(0, innerWidth - visibleWidth(line)));
+		return `${this.theme.fg("accent", "│")} ${padded} ${this.theme.fg("accent", "│")}`;
+	}
+}
+
+function createRecapCard(summary: string) {
+	return (_tui: unknown, theme: { fg(color: string, text: string): string; bold(text: string): string }): Component => {
+		return new RecapWidgetCard(summary, theme);
+	};
+}
+
+class RecapWidgetCard implements Component {
+	constructor(
+		private readonly summary: string,
+		private readonly theme: { fg(color: string, text: string): string; bold(text: string): string },
+	) {}
+
+	render(width: number): string[] {
+		if (width < 8) return [truncateToWidth("Recap", Math.max(1, width))];
+
+		const cardWidth = Math.min(width, 100);
+		const innerWidth = Math.max(1, cardWidth - 4);
+		const border = (line: string) => this.theme.fg("accent", line);
+		const title = ` ${this.theme.bold("Recap")} `;
+		const topPrefix = `╭─${title}`;
+		const top = `${topPrefix}${"─".repeat(Math.max(0, cardWidth - visibleWidth(topPrefix) - 1))}╮`;
+		const bottom = `╰${"─".repeat(Math.max(0, cardWidth - 2))}╯`;
+
+		const answerLines = this.summary.split("\n").flatMap((line) => wrapTextWithAnsi(line || " ", innerWidth));
+		const hintLines = [this.theme.fg("dim", "Press Space, Enter, or Escape to dismiss")];
+		const maxAnswerLines = Math.max(1, MAX_WIDGET_LINES - hintLines.length - 2);
+		const visibleAnswerLines =
+			answerLines.length > maxAnswerLines
+				? [...answerLines.slice(0, maxAnswerLines - 1), this.theme.fg("dim", "…")]
+				: answerLines;
+
+		return [
+			border(top),
+			...visibleAnswerLines.map((line) => this.frameLine(line, innerWidth)),
+			...hintLines.map((line) => this.frameLine(line, innerWidth)),
+			border(bottom),
+		];
+	}
+
+	handleInput(): void {}
 
 	invalidate(): void {}
 
