@@ -1,9 +1,9 @@
 /**
  * /recap - one-sentence progress recap for Pi.
  *
- * Manual: `/recap` renders a transient overlay.
+ * Manual: `/recap` renders a dismissible widget above the editor.
  * Auto: after 10 minutes without a new turn_end, silently generates a recap
- * and renders a dismissible widget above the editor.
+ * and renders a non-intercepting widget above the editor until the next prompt.
  */
 
 import { complete, type UserMessage } from "@earendil-works/pi-ai";
@@ -42,12 +42,14 @@ export default function recapExtension(pi: ExtensionAPI) {
 	let autoAbortController: AbortController | undefined;
 	let disposed = false;
 	let activityVersion = 0;
+	let visibleWidgetMode: RecapMode | null = null;
 
 	const clearRecapWidget = (ctx: Pick<ExtensionContext, "ui">) => {
 		ctx.ui.setWidget(RECAP_CUSTOM_TYPE, undefined);
 		ctx.ui.setStatus(RECAP_CUSTOM_TYPE, undefined);
 		clearDismissHandler?.();
 		clearDismissHandler = undefined;
+		visibleWidgetMode = null;
 	};
 
 	const installDismissHandler = (ctx: ExtensionContext) => {
@@ -59,6 +61,26 @@ export default function recapExtension(pi: ExtensionAPI) {
 			}
 			return undefined;
 		});
+	};
+
+	const clearAutoRecapWidget = (ctx: Pick<ExtensionContext, "ui">) => {
+		if (visibleWidgetMode === "auto") {
+			clearRecapWidget(ctx);
+		}
+	};
+
+	const showRecapWidget = (summary: string, ctx: ExtensionContext, mode: RecapMode) => {
+		clearDismissHandler?.();
+		clearDismissHandler = undefined;
+		visibleWidgetMode = mode;
+		ctx.ui.setWidget(RECAP_CUSTOM_TYPE, createRecapCard(summary, { dismissible: mode === "manual" }), {
+			placement: "aboveEditor",
+		});
+		ctx.ui.setStatus(RECAP_CUSTOM_TYPE, ctx.ui.theme.fg("accent", "Recap ready"));
+
+		if (mode === "manual") {
+			installDismissHandler(ctx);
+		}
 	};
 
 	const clearIdleTimer = () => {
@@ -115,6 +137,10 @@ export default function recapExtension(pi: ExtensionAPI) {
 		),
 	}));
 
+	pi.on("before_agent_start", (_event, ctx) => {
+		clearAutoRecapWidget(ctx);
+	});
+
 	pi.on("turn_end", (_event, ctx) => {
 		lastActivityAt = Date.now();
 		activityVersion += 1;
@@ -163,7 +189,7 @@ export default function recapExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		if (!ctx.hasUI && manual) {
+		if (!ctx.hasUI) {
 			return;
 		}
 
@@ -172,20 +198,18 @@ export default function recapExtension(pi: ExtensionAPI) {
 			if (disposed || isAborted(signal)) return;
 
 			if (manual) {
-				if (ctx.hasUI) await showRecapOverlay(summary, ctx);
+				showRecapWidget(summary, ctx, "manual");
 			} else {
-				if (activityVersion !== recapActivityVersion || disposed || !ctx.hasUI) return;
+				if (activityVersion !== recapActivityVersion || visibleWidgetMode === "manual" || disposed || !ctx.hasUI) return;
 				alreadyFired = true;
-				ctx.ui.setWidget(RECAP_CUSTOM_TYPE, createRecapCard(summary), { placement: "aboveEditor" });
-				ctx.ui.setStatus(RECAP_CUSTOM_TYPE, ctx.ui.theme.fg("accent", "Recap ready"));
-				installDismissHandler(ctx);
+				showRecapWidget(summary, ctx, "auto");
 			}
 		} catch (error) {
 			if (isAbortError(error) || isAborted(signal)) return;
 			if (disposed) return;
 			const message = error instanceof Error ? error.message : String(error);
 			if (manual && ctx.hasUI) {
-				await showRecapOverlay(`Error: ${message}`, ctx);
+				showRecapWidget(`Error: ${message}`, ctx, "manual");
 			}
 			// Auto mode intentionally swallows recap errors.
 		}
@@ -321,72 +345,16 @@ function takeTailWithinBudget(items: string[], budget: number): string {
 	return selected.join("\n\n");
 }
 
-async function showRecapOverlay(summary: string, ctx: ExtensionContext): Promise<void> {
-	if (!ctx.hasUI) return;
-
-	await ctx.ui.custom<void>(
-		(_tui, theme, _keybindings, done) => {
-			const container = new OverlayCard("Recap", summary, "Press Enter or Esc to close", theme, done);
-			return container;
-		},
-		{ overlay: true },
-	);
-}
-
-class OverlayCard implements Component {
-	constructor(
-		private readonly title: string,
-		private readonly body: string,
-		private readonly hint: string,
-		private readonly theme: { fg(color: string, text: string): string; bold(text: string): string },
-		private readonly done: () => void,
-	) {}
-
-	render(width: number): string[] {
-		if (width < 8) return [truncateToWidth(this.title, Math.max(1, width))];
-
-		const cardWidth = Math.min(width, 88);
-		const innerWidth = Math.max(1, cardWidth - 4);
-		const border = (line: string) => this.theme.fg("accent", line);
-		const title = ` ${this.theme.bold(this.title)} `;
-		const topPrefix = `╭─${title}`;
-		const top = `${topPrefix}${"─".repeat(Math.max(0, cardWidth - visibleWidth(topPrefix) - 1))}╮`;
-		const bottom = `╰${"─".repeat(Math.max(0, cardWidth - 2))}╯`;
-
-		const bodyLines = this.body.split("\n").flatMap((line) => wrapTextWithAnsi(line || " ", innerWidth));
-		const hintLines = wrapTextWithAnsi(this.theme.fg("dim", this.hint), innerWidth);
-
-		return [
-			border(top),
-			...bodyLines.map((line) => this.frameLine(line, innerWidth)),
-			...hintLines.map((line) => this.frameLine(line, innerWidth)),
-			border(bottom),
-		];
-	}
-
-	handleInput(data: string): void {
-		if (matchesKey(data, Key.enter) || matchesKey(data, Key.escape)) {
-			this.done();
-		}
-	}
-
-	invalidate(): void {}
-
-	private frameLine(line: string, innerWidth: number): string {
-		const padded = line + " ".repeat(Math.max(0, innerWidth - visibleWidth(line)));
-		return `${this.theme.fg("accent", "│")} ${padded} ${this.theme.fg("accent", "│")}`;
-	}
-}
-
-function createRecapCard(summary: string) {
+function createRecapCard(summary: string, options: { dismissible: boolean }) {
 	return (_tui: unknown, theme: { fg(color: string, text: string): string; bold(text: string): string }): Component => {
-		return new RecapWidgetCard(summary, theme);
+		return new RecapWidgetCard(summary, options.dismissible, theme);
 	};
 }
 
 class RecapWidgetCard implements Component {
 	constructor(
 		private readonly summary: string,
+		private readonly dismissible: boolean,
 		private readonly theme: { fg(color: string, text: string): string; bold(text: string): string },
 	) {}
 
@@ -402,7 +370,7 @@ class RecapWidgetCard implements Component {
 		const bottom = `╰${"─".repeat(Math.max(0, cardWidth - 2))}╯`;
 
 		const answerLines = this.summary.split("\n").flatMap((line) => wrapTextWithAnsi(line || " ", innerWidth));
-		const hintLines = [this.theme.fg("dim", "Press Space, Enter, or Escape to dismiss")];
+		const hintLines = this.dismissible ? [this.theme.fg("dim", "Press Space, Enter, or Escape to dismiss")] : [];
 		const maxAnswerLines = Math.max(1, MAX_WIDGET_LINES - hintLines.length - 2);
 		const visibleAnswerLines =
 			answerLines.length > maxAnswerLines
