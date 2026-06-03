@@ -18,6 +18,7 @@ pi -e git:github.com/YukiagoTpf/yuki-pi
 
 - `extensions/btw.ts` — `/btw` one-shot side-question command.
 - `extensions/recap.ts` — `/recap` one-sentence session progress recap.
+- `extensions/enable-grep.ts` — enables Pi's built-in `grep` tool.
 
 ## Recap
 
