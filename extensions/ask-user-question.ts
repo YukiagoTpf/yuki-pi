@@ -23,6 +23,9 @@ const QuestionOptionSchema = Type.Object({
 	value: Type.Optional(Type.String({ description: "Optional machine-readable value; defaults to label" })),
 });
 
+const MAX_QUESTION_LINES = 12;
+const MAX_DESCRIPTION_LINES = 2;
+
 const AskUserQuestionParams = Type.Object({
 	question: Type.String({ description: "Clear question to ask the user" }),
 	options: Type.Optional(
@@ -218,21 +221,35 @@ function askWithOptions(
 				const safeWidth = Math.max(1, width);
 				const lines: string[] = [];
 				const add = (line: string) => lines.push(truncateToWidth(line, safeWidth));
-				const addWrappedStyled = (text: string, style: (value: string) => string, prefix = "", continuationPrefix = prefix) => {
+				const wrappedStyledLines = (text: string, style: (value: string) => string, prefix = "", continuationPrefix = prefix): string[] => {
+					const result: string[] = [];
 					const contentWidth = Math.max(1, safeWidth - Math.max(visibleWidth(prefix), visibleWidth(continuationPrefix)));
 					for (const physicalLine of text.split(/\r?\n/)) {
 						if (!physicalLine) {
-							lines.push("");
+							result.push("");
 							continue;
 						}
 						const wrappedLines = wrapTextWithAnsi(style(physicalLine), contentWidth);
-						wrappedLines.forEach((wrappedLine, index) => add((index === 0 ? prefix : continuationPrefix) + wrappedLine));
+						wrappedLines.forEach((wrappedLine, index) => result.push(truncateToWidth((index === 0 ? prefix : continuationPrefix) + wrappedLine, safeWidth)));
 					}
+					return result;
+				};
+				const addWrappedStyled = (text: string, style: (value: string) => string, prefix = "", continuationPrefix = prefix) => {
+					lines.push(...wrappedStyledLines(text, style, prefix, continuationPrefix));
+				};
+				const addLimitedWrappedStyled = (text: string, style: (value: string) => string, maxLines: number, prefix = "", continuationPrefix = prefix) => {
+					const wrapped = wrappedStyledLines(text, style, prefix, continuationPrefix);
+					if (wrapped.length <= maxLines) {
+						lines.push(...wrapped);
+						return;
+					}
+					lines.push(...wrapped.slice(0, maxLines));
+					add(theme.fg("dim", `… ${wrapped.length - maxLines} more line(s); type a custom answer to revise`));
 				};
 				const border = theme.fg("accent", "─".repeat(Math.max(0, width)));
 
 				add(border);
-				addWrappedStyled(question, (text) => theme.fg("accent", theme.bold(text)));
+				addLimitedWrappedStyled(question, (text) => theme.fg("accent", theme.bold(text)), MAX_QUESTION_LINES);
 				lines.push("");
 
 				for (let index = 0; index < options.length; index++) {
@@ -243,7 +260,7 @@ function askWithOptions(
 					const text = `${index + 1}. ${option.label}`;
 					addWrappedStyled(text, (value) => theme.fg(selected ? "accent" : "text", value), prefix, continuationPrefix);
 					if (option.description) {
-						addWrappedStyled(option.description, (value) => theme.fg("muted", value), "    ");
+						addLimitedWrappedStyled(option.description, (value) => theme.fg("muted", value), MAX_DESCRIPTION_LINES, "    ");
 					}
 				}
 
@@ -278,6 +295,14 @@ function askWithOptions(
 		};
 
 		return component;
+	}, {
+		overlay: true,
+		overlayOptions: {
+			width: "90%",
+			minWidth: 50,
+			maxHeight: "85%",
+			margin: 1,
+		},
 	});
 }
 
