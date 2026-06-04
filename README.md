@@ -16,9 +16,14 @@ pi -e git:github.com/YukiagoTpf/yuki-pi
 
 ## Contents
 
+- `extensions/ask-user-question.ts` — `ask_user_question` tool for structured user Q&A.
 - `extensions/btw.ts` — `/btw` one-shot side-question command.
 - `extensions/recap.ts` — `/recap` one-sentence session progress recap.
 - `extensions/enable-grep.ts` — enables Pi's built-in `grep` tool.
+
+## Ask User Question
+
+The `ask_user_question` tool lets the model pause to ask one user-facing question, optionally with choices and an “Other” custom answer. The selected answer is returned as the tool result so the model can continue with the user's decision in context.
 
 ## Recap
 
