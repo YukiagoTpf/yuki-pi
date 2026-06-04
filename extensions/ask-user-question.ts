@@ -1,5 +1,5 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { decodeKittyPrintable, Input, Key, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 interface QuestionOption {
@@ -48,7 +48,7 @@ export default function askUserQuestionExtension(pi: ExtensionAPI) {
 		],
 		parameters: AskUserQuestionParams,
 
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const options = params.options ?? [];
 			const allowOther = params.allowOther !== false;
 
@@ -73,28 +73,16 @@ export default function askUserQuestionExtension(pi: ExtensionAPI) {
 				return answeredResult(params.question, options, trimmed, { wasCustom: true });
 			}
 
-			const choices = options.map((option, index) => formatChoice(option, index));
-			const otherChoice = `${options.length + 1}. Other / custom answer`;
-			const allChoices = allowOther ? [...choices, otherChoice] : choices;
-			const selected = await ctx.ui.select(params.question, allChoices);
+			const selected = await askWithOptions(ctx, params.question, options, allowOther, signal);
 
 			if (!selected) {
 				return cancelledResult(params.question, options);
 			}
 
-			const selectedIndex = allChoices.indexOf(selected);
-			if (allowOther && selectedIndex === options.length) {
-				const answer = await ctx.ui.input("Custom answer", "Type your answer...");
-				const trimmed = answer?.trim();
-				if (!trimmed) {
-					return cancelledResult(params.question, options);
-				}
-				return answeredResult(params.question, options, trimmed, { wasCustom: true });
-			}
-
-			const option = options[selectedIndex];
-			const answer = option.value ?? option.label;
-			return answeredResult(params.question, options, answer, { label: option.label, wasCustom: false });
+			return answeredResult(params.question, options, selected.answer, {
+				label: selected.label,
+				wasCustom: selected.wasCustom,
+			});
 		},
 
 		renderCall(args, theme, _context) {
@@ -125,9 +113,181 @@ export default function askUserQuestionExtension(pi: ExtensionAPI) {
 	});
 }
 
-function formatChoice(option: QuestionOption, index: number): string {
-	const suffix = option.description ? ` — ${option.description}` : "";
-	return `${index + 1}. ${option.label}${suffix}`;
+interface AskSelection {
+	answer: string;
+	label?: string;
+	wasCustom: boolean;
+}
+
+function askWithOptions(
+	ctx: ExtensionContext,
+	question: string,
+	options: QuestionOption[],
+	allowOther: boolean,
+	signal: AbortSignal,
+): Promise<AskSelection | null> {
+	if (signal.aborted) return Promise.resolve(null);
+
+	return ctx.ui.custom<AskSelection | null>((tui, theme, _keybindings, done) => {
+		let selectedIndex = 0;
+		let focused = false;
+		let cachedLines: string[] | undefined;
+		let cachedWidth: number | undefined;
+		let completed = false;
+		const customIndex = allowOther ? options.length : -1;
+		const input = new Input();
+
+		const finish = (result: AskSelection | null) => {
+			if (completed) return;
+			completed = true;
+			done(result);
+		};
+
+		const onAbort = () => finish(null);
+		signal.addEventListener("abort", onAbort, { once: true });
+
+		const refresh = () => {
+			cachedLines = undefined;
+			cachedWidth = undefined;
+			input.focused = focused && selectedIndex === customIndex;
+			tui.requestRender();
+		};
+
+		const submitCustom = () => {
+			const answer = input.getValue().trim();
+			if (answer) {
+				finish({ answer, wasCustom: true });
+			}
+		};
+
+		const component = {
+			get focused() {
+				return focused;
+			},
+			set focused(value: boolean) {
+				focused = value;
+				input.focused = focused && selectedIndex === customIndex;
+			},
+			handleInput(data: string) {
+				if (matchesKey(data, Key.escape)) {
+					finish(null);
+					return;
+				}
+
+				if (matchesKey(data, Key.up)) {
+					selectedIndex = Math.max(0, selectedIndex - 1);
+					refresh();
+					return;
+				}
+
+				if (matchesKey(data, Key.down)) {
+					selectedIndex = Math.min((allowOther ? options.length : options.length - 1), selectedIndex + 1);
+					refresh();
+					return;
+				}
+
+				if (matchesKey(data, Key.enter) || data === "\n") {
+					if (selectedIndex === customIndex) {
+						submitCustom();
+						return;
+					}
+
+					const option = options[selectedIndex];
+					if (option) {
+						finish({ answer: option.value ?? option.label, label: option.label, wasCustom: false });
+					}
+					return;
+				}
+
+				if (selectedIndex === customIndex) {
+					input.handleInput(data);
+					refresh();
+					return;
+				}
+
+				if (allowOther && isTextEntry(data)) {
+					selectedIndex = customIndex;
+					input.handleInput(data);
+					refresh();
+				}
+			},
+			render(width: number) {
+				if (cachedLines && cachedWidth === width) return cachedLines;
+
+				input.focused = focused && selectedIndex === customIndex;
+				const safeWidth = Math.max(1, width);
+				const lines: string[] = [];
+				const add = (line: string) => lines.push(truncateToWidth(line, safeWidth));
+				const addWrappedStyled = (text: string, style: (value: string) => string, prefix = "", continuationPrefix = prefix) => {
+					const contentWidth = Math.max(1, safeWidth - Math.max(visibleWidth(prefix), visibleWidth(continuationPrefix)));
+					for (const physicalLine of text.split(/\r?\n/)) {
+						if (!physicalLine) {
+							lines.push("");
+							continue;
+						}
+						const wrappedLines = wrapTextWithAnsi(style(physicalLine), contentWidth);
+						wrappedLines.forEach((wrappedLine, index) => add((index === 0 ? prefix : continuationPrefix) + wrappedLine));
+					}
+				};
+				const border = theme.fg("accent", "─".repeat(Math.max(0, width)));
+
+				add(border);
+				addWrappedStyled(question, (text) => theme.fg("accent", theme.bold(text)));
+				lines.push("");
+
+				for (let index = 0; index < options.length; index++) {
+					const option = options[index];
+					const selected = index === selectedIndex;
+					const prefix = selected ? theme.fg("accent", "→ ") : "  ";
+					const continuationPrefix = selected ? theme.fg("accent", "  ") : "  ";
+					const text = `${index + 1}. ${option.label}`;
+					addWrappedStyled(text, (value) => theme.fg(selected ? "accent" : "text", value), prefix, continuationPrefix);
+					if (option.description) {
+						addWrappedStyled(option.description, (value) => theme.fg("muted", value), "    ");
+					}
+				}
+
+				if (allowOther) {
+					const selected = selectedIndex === customIndex;
+					const prefix = selected ? theme.fg("accent", "→ ") : "  ";
+					const continuationPrefix = selected ? theme.fg("accent", "  ") : "  ";
+					addWrappedStyled(`${customIndex + 1}. Other / custom answer`, (value) => theme.fg(selected ? "accent" : "text", value), prefix, continuationPrefix);
+					for (const line of input.render(Math.max(1, safeWidth - 4))) {
+						add(`    ${line}`);
+					}
+				}
+
+				lines.push("");
+				addWrappedStyled(
+					allowOther ? "↑↓ navigate • Enter select/submit • type custom answer • Esc cancel" : "↑↓ navigate • Enter select • Esc cancel",
+					(value) => theme.fg("dim", value),
+				);
+				add(border);
+
+				cachedLines = lines;
+				cachedWidth = width;
+				return lines;
+			},
+			invalidate() {
+				cachedLines = undefined;
+				cachedWidth = undefined;
+			},
+			dispose() {
+				signal.removeEventListener("abort", onAbort);
+			},
+		};
+
+		return component;
+	});
+}
+
+function isTextEntry(data: string): boolean {
+	if (data.includes("\x1b[200~")) return true;
+	if (decodeKittyPrintable(data) !== undefined) return true;
+	return [...data].length > 0 && ![...data].some((char) => {
+		const code = char.charCodeAt(0);
+		return code < 32 || code === 0x7f || (code >= 0x80 && code <= 0x9f);
+	});
 }
 
 function makeDetails(
