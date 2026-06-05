@@ -23,8 +23,7 @@ const QuestionOptionSchema = Type.Object({
 	value: Type.Optional(Type.String({ description: "Optional machine-readable value; defaults to label" })),
 });
 
-const MAX_QUESTION_LINES = 12;
-const MAX_DESCRIPTION_LINES = 2;
+const MAX_QUESTION_LINES = 6;
 
 const AskUserQuestionParams = Type.Object({
 	question: Type.String({ description: "Clear question to ask the user" }),
@@ -244,7 +243,7 @@ function askWithOptions(
 						return;
 					}
 					lines.push(...wrapped.slice(0, maxLines));
-					add(theme.fg("dim", `… ${wrapped.length - maxLines} more line(s); type a custom answer to revise`));
+					add(theme.fg("dim", `… ${wrapped.length - maxLines} more lines`));
 				};
 				const border = theme.fg("accent", "─".repeat(Math.max(0, width)));
 
@@ -259,8 +258,9 @@ function askWithOptions(
 					const continuationPrefix = selected ? theme.fg("accent", "  ") : "  ";
 					const text = `${index + 1}. ${option.label}`;
 					addWrappedStyled(text, (value) => theme.fg(selected ? "accent" : "text", value), prefix, continuationPrefix);
-					if (option.description) {
-						addLimitedWrappedStyled(option.description, (value) => theme.fg("muted", value), MAX_DESCRIPTION_LINES, "    ");
+					if (selected && option.description) {
+						const descriptionLines = wrappedStyledLines(option.description, (value) => theme.fg("muted", value), "    ");
+						if (descriptionLines[0]) add(descriptionLines[0]);
 					}
 				}
 
@@ -295,14 +295,6 @@ function askWithOptions(
 		};
 
 		return component;
-	}, {
-		overlay: true,
-		overlayOptions: {
-			width: "90%",
-			minWidth: 50,
-			maxHeight: "85%",
-			margin: 1,
-		},
 	});
 }
 

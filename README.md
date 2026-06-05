@@ -23,7 +23,7 @@ pi -e git:github.com/YukiagoTpf/yuki-pi
 
 ## Ask User Question
 
-The `ask_user_question` tool lets the model pause to ask one user-facing question, optionally with choices and an “Other” custom answer. When choices are shown, the custom answer is an inline input box (Claude Code-style), so typing a custom response no longer requires selecting “Other” first. Long question text and option descriptions are wrapped instead of truncated, and the dialog renders as a bounded overlay to avoid pushing the working UI down during navigation. The selected answer is returned as the tool result so the model can continue with the user's decision in context.
+The `ask_user_question` tool lets the model pause to ask one user-facing question, optionally with choices and an “Other” custom answer. When choices are shown, the custom answer is an inline input box (Claude Code-style), so typing a custom response no longer requires selecting “Other” first. Long question text is wrapped and capped, and only the selected option's description is shown to keep the dialog height stable during navigation. The selected answer is returned as the tool result so the model can continue with the user's decision in context.
 
 ## Recap
 
