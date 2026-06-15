@@ -56,3 +56,12 @@ Use `/recap` to generate a one-sentence summary of what the current coding sessi
 It uses the currently selected Pi model with low reasoning and shows the result in a widget above the editor.
 Manual `/recap` widgets can be dismissed with Space, Enter, or Esc.
 After 10 minutes without a new completed turn, it also generates the same one-sentence recap automatically; that automatic widget clears when the next prompt starts.
+
+## Development
+
+Pure, dependency-free helpers live in `extensions/shared/` so they can be unit tested without loading the Pi runtime. Tests use Node's built-in runner and need no install:
+
+```bash
+npm test          # node --test over test/*.test.ts
+npm run typecheck # tsc --noEmit (requires `npm install` first)
+```

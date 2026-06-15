@@ -3,6 +3,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { PLAN_STATE_CUSTOM_TYPE, TODO_STATE_CUSTOM_TYPE } from "../shared/constants.ts";
+import { parseTodosCommandArgs } from "../shared/todo-command.ts";
 
 export { PLAN_STATE_CUSTOM_TYPE, TODO_STATE_CUSTOM_TYPE };
 export const DEFAULT_STANDALONE_LIST_ID = "standalone-default";
@@ -426,19 +427,6 @@ function selectTodoState(states: Map<string, TodoState>, params: { listId?: stri
 		if (planState) return planState;
 	}
 	return states.get(DEFAULT_STANDALONE_LIST_ID) ?? [...states.values()][0];
-}
-
-function parseTodosCommandArgs(args: string):
-	| { action: "show"; listId?: string }
-	| { action: "clear"; scope?: "completed" | "all"; listId?: string } {
-	const tokens = args.trim().split(/\s+/).filter(Boolean);
-	if (tokens[0] !== "clear") return { action: "show", listId: tokens.join(" ") || undefined };
-
-	const [, first, ...rest] = tokens;
-	if (first === "completed" || first === "all") {
-		return { action: "clear", scope: first, listId: rest.join(" ") || undefined };
-	}
-	return { action: "clear", scope: "completed", listId: [first, ...rest].filter(Boolean).join(" ") || undefined };
 }
 
 function createStandaloneState(listId = DEFAULT_STANDALONE_LIST_ID): TodoState {

@@ -14,6 +14,7 @@ import { complete, type UserMessage } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, type Component, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { takeTailWithinBudget } from "./shared/transcript.ts";
 
 const CUSTOM_TYPE = "btw";
 const SNAPSHOT_BUDGET_CHARS = 12_000;
@@ -217,21 +218,6 @@ function messageText(message: AgentMessage): string {
 		.filter((part): part is { type: "text"; text: string } => part.type === "text")
 		.map((part) => part.text)
 		.join("\n");
-}
-
-function takeTailWithinBudget(items: string[], budget: number): string {
-	const selected: string[] = [];
-	let used = 0;
-
-	for (let i = items.length - 1; i >= 0; i--) {
-		const item = items[i]!;
-		const cost = item.length + 2;
-		if (selected.length > 0 && used + cost > budget) break;
-		selected.unshift(item);
-		used += cost;
-	}
-
-	return selected.join("\n\n");
 }
 
 function createBTWCard(question: string, answer: string, options: { dismissible: boolean }) {

@@ -10,6 +10,7 @@ import { complete, type UserMessage } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, type Component, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { takeTailWithinBudget } from "./shared/transcript.ts";
 
 const RECAP_CUSTOM_TYPE = "recap";
 const TAIL_BUDGET_CHARS = 8_000;
@@ -328,21 +329,6 @@ function messageText(message: AgentMessage): string {
 		.map((part) => (part.type === "text" ? part.text : ""))
 		.filter(Boolean)
 		.join("\n");
-}
-
-function takeTailWithinBudget(items: string[], budget: number): string {
-	const selected: string[] = [];
-	let used = 0;
-
-	for (let i = items.length - 1; i >= 0; i--) {
-		const item = items[i]!;
-		const cost = item.length + 2;
-		if (selected.length > 0 && used + cost > budget) break;
-		selected.unshift(item);
-		used += cost;
-	}
-
-	return selected.join("\n\n");
 }
 
 function createRecapCard(summary: string, options: { dismissible: boolean }) {

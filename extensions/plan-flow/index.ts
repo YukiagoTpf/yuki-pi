@@ -7,6 +7,7 @@ import { access, mkdir, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { createTodoState, makeTodoStateRecord } from "../todo/index.ts";
 import { PLAN_STATE_CUSTOM_TYPE, TODO_STATE_CUSTOM_TYPE } from "../shared/constants.ts";
+import { isExecutableResolution, slugify } from "../shared/plan-helpers.ts";
 
 export { PLAN_STATE_CUSTOM_TYPE };
 
@@ -525,16 +526,6 @@ function recordPlanAnswer(current: PlanFlowState, params: PlanAskInput, answer: 
 	return touch({ ...current, questions, askCount: current.askCount + 1 });
 }
 
-function isExecutableResolution(value: string | undefined): boolean {
-	if (!value) return false;
-	const normalized = value.trim().toLowerCase();
-	if (!normalized) return false;
-	// Reject non-answers regardless of length; a short but concrete answer
-	// ("no", "v2", "用 A") is a valid decision and must count as resolved.
-	if (/^(随便|都行|看情况|之后再说|到时候再说|无所谓|不知道|不清楚|不确定|whatever|up to you|later|tbd|idk|dunno)$/.test(normalized)) return false;
-	return true;
-}
-
 function buildGrillPlanResult(state: PlanFlowState): string {
 	const open = state.questions.filter((question) => question.status === "open");
 	if (state.phase === "research") return "Research restarted. Keep resolved decisions and inspect more files before calling grill_plan again.";
@@ -934,11 +925,6 @@ function createPlanId(): string {
 	const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
 	const random = Math.random().toString(16).slice(2, 10).padEnd(8, "0");
 	return `${stamp}-${random}`;
-}
-
-function slugify(value: string): string {
-	const slug = value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").replace(/-{2,}/g, "-").slice(0, 60);
-	return slug || "plan";
 }
 
 async function exists(path: string): Promise<boolean> {
