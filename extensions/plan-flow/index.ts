@@ -145,6 +145,9 @@ const GrillDoneParams = Type.Object({
 });
 
 export default function planFlowExtension(pi: ExtensionAPI) {
+	// Guards against running two automatic reviews concurrently within one process.
+	let reviewInFlight = false;
+
 	pi.registerCommand("plan", {
 		description: "Start yuki plan-flow for a requested change",
 		handler: async (args, ctx) => {
@@ -255,17 +258,25 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("turn_end", async (event, ctx) => {
+	pi.on("turn_end", async (_event, ctx) => {
 		const state = reconstructPlanState(ctx);
+		// Fire whenever a draft is awaiting its automatic review, not just on the
+		// turn that produced the plan_write. If a prior review was interrupted
+		// (crash/restart), the durable state is still drafting+reviewPending, and
+		// the next turn_end re-triggers it instead of getting stuck until abort.
 		if (!state?.active || state.phase !== "drafting" || !state.reviewPending || state.reviewed) return;
-		const hasPlanWrite = event.toolResults?.some((result) => result.toolName === "plan_write") ?? false;
-		if (!hasPlanWrite) return;
+		if (reviewInFlight) return;
 
-		const reviewed = await runAutomaticReview(ctx, state);
-		persistPlanState(pi, reviewed, reviewed.reviewSkipped ? "review_skipped" : "review_complete");
-		applyActiveTools(pi, reviewed);
-		updatePlanUi(ctx, reviewed);
-		pi.sendUserMessage(buildReviewSteeringMessage(reviewed), { deliverAs: "steer" });
+		reviewInFlight = true;
+		try {
+			const reviewed = await runAutomaticReview(ctx, state);
+			persistPlanState(pi, reviewed, reviewed.reviewSkipped ? "review_skipped" : "review_complete");
+			applyActiveTools(pi, reviewed);
+			updatePlanUi(ctx, reviewed);
+			pi.sendUserMessage(buildReviewSteeringMessage(reviewed), { deliverAs: "steer" });
+		} finally {
+			reviewInFlight = false;
+		}
 	});
 
 	pi.registerTool({
