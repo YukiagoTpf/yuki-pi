@@ -7,3 +7,6 @@ pnpm-debug.log*
 .env
 .env.*
 !.env.example
+
+# Pi local/runtime state (agent context file, plan drafts)
+.pi/
