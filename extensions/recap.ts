@@ -76,7 +76,7 @@ export default function recapExtension(pi: ExtensionAPI) {
 		ctx.ui.setWidget(RECAP_CUSTOM_TYPE, createRecapCard(summary, { dismissible: mode === "manual" }), {
 			placement: "aboveEditor",
 		});
-		ctx.ui.setStatus(RECAP_CUSTOM_TYPE, ctx.ui.theme.fg("accent", "Recap ready"));
+		ctx.ui.setStatus(RECAP_CUSTOM_TYPE, undefined);
 
 		if (mode === "manual") {
 			installDismissHandler(ctx);
