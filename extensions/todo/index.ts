@@ -422,10 +422,8 @@ function updateTodoWidget(ctx: ExtensionContext, states: Map<string, TodoState>,
 
 	const summary = summarizeTodoState(state);
 	ctx.ui.setStatus("yuki-todos", `📋 ${summary.completed}/${summary.total}`);
-	ctx.ui.setWidget(
-		"yuki-todos",
-		state.todos.slice(0, 8).map((todo) => `${statusGlyph(todo.status)} ${todo.content}`),
-	);
+	// Keep only the compact footer status. The expanded todo-list widget is intentionally hidden.
+	ctx.ui.setWidget("yuki-todos", undefined);
 }
 
 function statusBox(status: TodoStatus): string {
