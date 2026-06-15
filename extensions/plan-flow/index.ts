@@ -251,6 +251,15 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 	pi.on("tool_call", async (event, ctx) => {
 		const state = reconstructPlanState(ctx);
 		if (!state?.active || state.phase === "aborted") return;
+		// Block plan_write while an automatic review is running. Otherwise an
+		// interjected turn could land a newer draft that the in-flight review
+		// (built from the older snapshot) would then overwrite on persist.
+		if (reviewInFlight && event.toolName === "plan_write") {
+			return {
+				block: true,
+				reason: "yuki plan-flow: automatic review in progress; wait for the review result before calling plan_write again.",
+			};
+		}
 		const allowed = getAllowedToolsForState(state);
 		if (!allowed.includes(event.toolName)) {
 			return {
