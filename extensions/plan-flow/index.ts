@@ -687,6 +687,11 @@ async function approvePlan(pi: ExtensionAPI, ctx: ExtensionContext, current: Pla
 	const approvedAt = new Date().toISOString();
 	const todoListId = `plan-${current.planId}`;
 	const finalPath = await writeFinalPlan(ctx, { ...current, phase: "executing", approved: true, approvedAt, todoListId });
+	// The draft was a working artifact; the canonical plan now lives at finalPath.
+	// Remove it so approved drafts don't accumulate in the user's .pi/ directory.
+	if (current.draftPath) {
+		await unlink(resolve(ctx.cwd, current.draftPath)).catch(() => undefined);
+	}
 	const todoState = createTodoState({
 		listId: todoListId,
 		source: "plan",
