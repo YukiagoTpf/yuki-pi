@@ -25,6 +25,17 @@ describe("isExecutableResolution", () => {
 		assert.equal(isExecutableResolution("use option A, decide caching later"), true);
 		assert.equal(isExecutableResolution("随便选 Postgres 就行"), true);
 	});
+
+	it("rejects punctuation-only answers", () => {
+		for (const value of ["。", "？？", "...", "!!!", "—"]) {
+			assert.equal(isExecutableResolution(value), false, `expected '${value}' to be rejected`);
+		}
+	});
+
+	it("accepts purely numeric answers", () => {
+		assert.equal(isExecutableResolution("3"), true);
+		assert.equal(isExecutableResolution("v2"), true);
+	});
 });
 
 describe("slugify", () => {

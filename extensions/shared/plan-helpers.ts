@@ -26,6 +26,9 @@ export function isExecutableResolution(value: string | undefined): boolean {
 	if (!value) return false;
 	const normalized = value.trim().toLowerCase();
 	if (!normalized) return false;
+	// Require at least one letter/number/ideograph so punctuation-only
+	// "answers" (e.g. "。", "？？") aren't recorded as decisions.
+	if (!/[\p{L}\p{N}]/u.test(normalized)) return false;
 	if (/^(随便|都行|看情况|之后再说|到时候再说|无所谓|不知道|不清楚|不确定|whatever|up to you|later|tbd|idk|dunno)$/.test(normalized)) {
 		return false;
 	}
