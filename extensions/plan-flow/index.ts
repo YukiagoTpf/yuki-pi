@@ -516,8 +516,11 @@ function recordPlanAnswer(current: PlanFlowState, params: PlanAskInput, answer: 
 function isExecutableResolution(value: string | undefined): boolean {
 	if (!value) return false;
 	const normalized = value.trim().toLowerCase();
-	if (/^(随便|都行|看情况|之后再说|到时候再说|无所谓|whatever|up to you|later)$/.test(normalized)) return false;
-	return normalized.length >= 4;
+	if (!normalized) return false;
+	// Reject non-answers regardless of length; a short but concrete answer
+	// ("no", "v2", "用 A") is a valid decision and must count as resolved.
+	if (/^(随便|都行|看情况|之后再说|到时候再说|无所谓|不知道|不清楚|不确定|whatever|up to you|later|tbd|idk|dunno)$/.test(normalized)) return false;
+	return true;
 }
 
 function buildGrillPlanResult(state: PlanFlowState): string {
