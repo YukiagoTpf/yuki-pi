@@ -868,7 +868,7 @@ function buildPhasePrompt(state: PlanFlowState): string {
 		return `[YUKI PLAN FLOW: research]\nYou are in read-only planning mode for request: ${state.request}\nInspect files only. Do not edit or run mutating commands. When ready, call grill_plan with only critical decision questions. Do not call plan_write yet.`;
 	}
 	if (state.phase === "grilling") {
-		return `[YUKI PLAN FLOW: grilling]\nAsk at most ${state.maxAskCount} critical decision questions total using plan_ask. Current count: ${state.askCount}. Do not ask facts you can inspect. Invalid resolutions include: 随便, 都行, 看情况, 之后再说. Call grill_done when ready to draft.`;
+		return `[YUKI PLAN FLOW: grilling]\nAsk at most ${state.maxAskCount} critical decision questions total using plan_ask. Current count: ${state.askCount}. Do not ask facts you can inspect. Invalid resolutions are vague non-answers (e.g. 随便, 都行, 看情况, 之后再说, 无所谓, 不知道, whatever, TBD, idk) or punctuation-only replies. Call grill_done when ready to draft.`;
 	}
 	if (state.phase === "drafting") {
 		return "[YUKI PLAN FLOW: drafting]\nCall plan_write with structured steps. The extension will run automatic review after plan_write; do not call plan_exit until review steering arrives.";
