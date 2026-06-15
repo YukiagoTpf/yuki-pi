@@ -2,9 +2,9 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
+import { PLAN_STATE_CUSTOM_TYPE, TODO_STATE_CUSTOM_TYPE } from "../shared/constants.ts";
 
-export const TODO_STATE_CUSTOM_TYPE = "yuki-todo-state";
-export const PLAN_STATE_CUSTOM_TYPE = "yuki-plan-flow-state";
+export { PLAN_STATE_CUSTOM_TYPE, TODO_STATE_CUSTOM_TYPE };
 export const DEFAULT_STANDALONE_LIST_ID = "standalone-default";
 
 export type TodoStatus = "pending" | "in_progress" | "completed";

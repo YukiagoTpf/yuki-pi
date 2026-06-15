@@ -5,9 +5,10 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { access, mkdir, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { createTodoState, makeTodoStateRecord, TODO_STATE_CUSTOM_TYPE } from "../todo/index.ts";
+import { createTodoState, makeTodoStateRecord } from "../todo/index.ts";
+import { PLAN_STATE_CUSTOM_TYPE, TODO_STATE_CUSTOM_TYPE } from "../shared/constants.ts";
 
-export const PLAN_STATE_CUSTOM_TYPE = "yuki-plan-flow-state";
+export { PLAN_STATE_CUSTOM_TYPE };
 
 const PLAN_TOOLS = new Set(["plan_ask", "grill_plan", "grill_done", "plan_write", "plan_exit"]);
 const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
