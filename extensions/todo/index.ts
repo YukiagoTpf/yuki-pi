@@ -62,6 +62,14 @@ const TodoWriteParams = Type.Object({
 
 type TodoWriteInput = Static<typeof TodoWriteParams>;
 
+const TodoClearParams = Type.Object({
+	listId: Type.Optional(Type.String({ description: "Todo list id. Omit to use the current/default list." })),
+	scope: Type.Optional(StringEnum(["completed", "all"] as const)),
+	note: Type.Optional(Type.String({ description: "Optional clear note" })),
+});
+
+type TodoClearInput = Static<typeof TodoClearParams>;
+
 const TodoReadParams = Type.Object({
 	listId: Type.Optional(Type.String({ description: "Todo list id. Omit to use the current/default list." })),
 });
@@ -122,7 +130,7 @@ export default function todoExtension(pi: ExtensionAPI) {
 			"Use todo_write to maintain task progress when the user asks for a todo list or when executing a yuki-pi plan.",
 			"todo_write may be used without an active plan for standalone todos.",
 			"For plan-owned todos, todo_write must keep at most one in_progress item and must include evidence when marking an item completed.",
-			"Do not omit existing todo ids from todo_write unless you are intentionally using a future deletion tool; silent deletion is rejected.",
+			"Do not omit existing todo ids from todo_write; use todo_clear when the user explicitly wants to clear completed or all standalone todos.",
 		],
 		parameters: TodoWriteParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -163,13 +171,88 @@ export default function todoExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerTool({
+		name: "todo_clear",
+		label: "Todo Clear",
+		description: "Clear completed or all todos from a standalone yuki-pi todo list. Plan-owned lists cannot be cleared.",
+		promptSnippet: "Clear completed or all standalone yuki-pi todos explicitly.",
+		promptGuidelines: [
+			"Use todo_clear when starting a new standalone task list or when the user explicitly asks to clear completed todos.",
+			"todo_clear defaults to scope 'completed'; use scope 'all' only when the user asks to reset or clear the whole standalone list.",
+			"todo_clear must not be used for plan-owned todo lists because plan todos are execution records.",
+		],
+		parameters: TodoClearParams,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			states = reconstructTodoStates(ctx);
+			const activePlan = getActivePlanRef(ctx);
+			const current = selectTodoState(states, params, activePlan) ?? createStandaloneState(params.listId);
+			const { state: next, cleared, scope } = applyTodoClear(current, params);
+			states.set(next.listId, next);
+			updateTodoWidget(ctx, states, activePlan);
+
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: `Cleared ${cleared.length} ${scope === "completed" ? "completed " : ""}todo(s) from list '${next.listId}'. ${summarizeTodoState(next).completed}/${next.todos.length} completed remain.`,
+					},
+				],
+				details: {
+					todoState: next,
+					summary: summarizeTodoState(next),
+					note: params.note,
+					scope,
+					clearedIds: cleared.map((todo) => todo.id),
+				},
+			};
+		},
+		renderCall(args, theme) {
+			const listId = typeof args.listId === "string" ? args.listId : "current";
+			const scope = args.scope === "all" ? "all" : "completed";
+			return new Text(
+				theme.fg("toolTitle", theme.bold("todo_clear ")) + theme.fg("muted", `${listId} `) + theme.fg("dim", scope),
+				0,
+				0,
+			);
+		},
+		renderResult(result, _options, theme) {
+			const details = result.details as { todoState?: TodoState; scope?: "completed" | "all"; clearedIds?: string[] } | undefined;
+			const state = details?.todoState;
+			if (!state) return new Text(textContent(result), 0, 0);
+			const clearedCount = details?.clearedIds?.length ?? 0;
+			const scope = details?.scope === "all" ? "all" : "completed";
+			const summary = summarizeTodoState(state);
+			return new Text(
+				theme.fg("success", "✓ todo cleared ") +
+					theme.fg("muted", `${clearedCount} ${scope === "completed" ? "completed " : ""}item(s); ${summary.completed}/${summary.total} completed remain`),
+				0,
+				0,
+			);
+		},
+	});
+
 	pi.registerCommand("todos", {
-		description: "Show yuki-pi todos on the current branch",
+		description: "Show or clear yuki-pi todos on the current branch",
 		handler: async (args, ctx) => {
 			states = reconstructTodoStates(ctx);
 			const activePlan = getActivePlanRef(ctx);
-			const listId = args.trim() || undefined;
-			const state = selectTodoState(states, { listId }, activePlan);
+			const parsed = parseTodosCommandArgs(args);
+
+			if (parsed.action === "clear") {
+				try {
+					const current = selectTodoState(states, { listId: parsed.listId }, activePlan) ?? createStandaloneState(parsed.listId);
+					const { state: next, cleared, scope } = applyTodoClear(current, { listId: parsed.listId, scope: parsed.scope });
+					states.set(next.listId, next);
+					pi.appendEntry(TODO_STATE_CUSTOM_TYPE, makeTodoStateRecord(next, "command"));
+					updateTodoWidget(ctx, states, activePlan);
+					ctx.ui.notify(`Cleared ${cleared.length} ${scope === "completed" ? "completed " : ""}todo(s) from ${next.listId}.`, "info");
+				} catch (error) {
+					ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				}
+				return;
+			}
+
+			const state = selectTodoState(states, { listId: parsed.listId }, activePlan);
 
 			if (!state) {
 				ctx.ui.notify("No yuki-pi todos on this branch yet. Ask the agent to use todo_write.", "info");
@@ -222,7 +305,7 @@ export function reconstructTodoStates(ctx: ExtensionContext): Map<string, TodoSt
 		if (entry.type !== "message") continue;
 		const message = entry.message;
 		if (message.role !== "toolResult") continue;
-		if (message.toolName !== "todo_write" && message.toolName !== "todo_read") continue;
+		if (message.toolName !== "todo_write" && message.toolName !== "todo_read" && message.toolName !== "todo_clear") continue;
 
 		const details = message.details as { todoState?: TodoState } | undefined;
 		if (details?.todoState) {
@@ -265,6 +348,28 @@ function applyTodoWrite(current: TodoState, params: TodoWriteInput, activePlan: 
 		todos: mergedTodos,
 		updatedAt: now,
 	});
+}
+
+function applyTodoClear(current: TodoState, params: TodoClearInput): { state: TodoState; cleared: TodoItem[]; scope: "completed" | "all" } {
+	if (current.source !== "standalone") {
+		throw new Error("todo_clear: only standalone todo lists can be cleared; plan-owned and workflow todo lists are execution records.");
+	}
+
+	const now = new Date().toISOString();
+	const scope = params.scope ?? "completed";
+	const cleared = scope === "all" ? current.todos : current.todos.filter((todo) => todo.status === "completed");
+	const clearedIds = new Set(cleared.map((todo) => todo.id));
+	const remaining = current.todos.filter((todo) => !clearedIds.has(todo.id));
+
+	return {
+		state: normalizeTodoState({
+			...current,
+			todos: remaining,
+			updatedAt: now,
+		}),
+		cleared,
+		scope,
+	};
 }
 
 function validateIncomingTodos(todos: TodoItem[]) {
@@ -321,6 +426,19 @@ function selectTodoState(states: Map<string, TodoState>, params: { listId?: stri
 		if (planState) return planState;
 	}
 	return states.get(DEFAULT_STANDALONE_LIST_ID) ?? [...states.values()][0];
+}
+
+function parseTodosCommandArgs(args: string):
+	| { action: "show"; listId?: string }
+	| { action: "clear"; scope?: "completed" | "all"; listId?: string } {
+	const tokens = args.trim().split(/\s+/).filter(Boolean);
+	if (tokens[0] !== "clear") return { action: "show", listId: tokens.join(" ") || undefined };
+
+	const [, first, ...rest] = tokens;
+	if (first === "completed" || first === "all") {
+		return { action: "clear", scope: first, listId: rest.join(" ") || undefined };
+	}
+	return { action: "clear", scope: "completed", listId: [first, ...rest].filter(Boolean).join(" ") || undefined };
 }
 
 function createStandaloneState(listId = DEFAULT_STANDALONE_LIST_ID): TodoState {

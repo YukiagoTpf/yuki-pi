@@ -20,7 +20,7 @@ pi -e git:github.com/YukiagoTpf/yuki-pi
 - `extensions/btw.ts` — `/btw` one-shot side-question command.
 - `extensions/recap.ts` — `/recap` one-sentence session progress recap.
 - `extensions/enable-grep.ts` — enables Pi's built-in `grep` tool.
-- `extensions/todo/index.ts` — standalone branch-safe `todo_write` / `todo_read` tools and `/todos` command.
+- `extensions/todo/index.ts` — standalone branch-safe `todo_write` / `todo_clear` / `todo_read` tools and `/todos` command.
 - `extensions/plan-flow/index.ts` — `/plan` workflow: read-only research, grilling, automatic review, approval via `plan_exit`, final plan file, and plan-owned todo seeding.
 
 ## Ask User Question
@@ -42,11 +42,13 @@ The plan-flow module provides:
 
 The standalone todo module provides:
 
-- `todo_write` — create or update a branch-safe todo list.
+- `todo_write` — create or update a branch-safe todo list without implicit deletion.
+- `todo_clear` — explicitly clear completed or all todos from a standalone list.
 - `todo_read` — inspect the current/default todo list.
 - `/todos [listId]` — show todos on the current branch.
+- `/todos clear [completed|all] [listId]` — clear standalone todos from the current/default or named list.
 
-It works without `/plan`. Plan-flow seeds a plan-owned todo list via the exported todo state helpers; plan-owned lists apply stricter policy such as a single `in_progress` item and required evidence for completed items.
+It works without `/plan`. Plan-flow seeds a plan-owned todo list via the exported todo state helpers; plan-owned lists apply stricter policy such as a single `in_progress` item and required evidence for completed items. Plan-owned and workflow todo lists cannot be cleared with `todo_clear` because they are execution records.
 
 ## Recap
 
