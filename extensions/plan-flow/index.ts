@@ -852,7 +852,7 @@ function updatePlanUi(ctx: ExtensionContext, state: PlanFlowState) {
 		ctx.ui.setWidget("yuki-plan", undefined);
 		return;
 	}
-	ctx.ui.setStatus("yuki-plan", `🧭 ${state.phase}`);
+	ctx.ui.setStatus("yuki-plan", `plan ${state.phase}`);
 	if (state.steps.length > 0) {
 		ctx.ui.setWidget("yuki-plan", state.steps.map((step, index) => `${index + 1}. ${step.content}`));
 	} else {

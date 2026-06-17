@@ -160,13 +160,13 @@ export default function todoExtension(pi: ExtensionAPI) {
 			const state = (result.details as { todoState?: TodoState } | undefined)?.todoState;
 			if (!state) return new Text(textContent(result), 0, 0);
 			const summary = summarizeTodoState(state);
-			let text = theme.fg("success", "✓ todo updated ") + theme.fg("muted", `${summary.completed}/${summary.total} completed`);
+			let text = theme.fg("success", "todo updated ") + theme.fg("muted", `${summary.completed}/${summary.total} completed`);
 			const display = expanded ? state.todos : state.todos.slice(0, 6);
 			for (const todo of display) {
 				text += "\n" + renderTodoLine(todo, theme);
 			}
 			if (!expanded && state.todos.length > display.length) {
-				text += "\n" + theme.fg("dim", `… ${state.todos.length - display.length} more`);
+				text += "\n" + theme.fg("dim", `... ${state.todos.length - display.length} more`);
 			}
 			return new Text(text, 0, 0);
 		},
@@ -224,7 +224,7 @@ export default function todoExtension(pi: ExtensionAPI) {
 			const scope = details?.scope === "all" ? "all" : "completed";
 			const summary = summarizeTodoState(state);
 			return new Text(
-				theme.fg("success", "✓ todo cleared ") +
+				theme.fg("success", "todo cleared ") +
 					theme.fg("muted", `${clearedCount} ${scope === "completed" ? "completed " : ""}item(s); ${summary.completed}/${summary.total} completed remain`),
 				0,
 				0,
@@ -512,7 +512,7 @@ function formatTodoStateForModel(state: TodoState): string {
 function formatTodoStateForHuman(state: TodoState): string {
 	const summary = summarizeTodoState(state);
 	return [
-		`${state.title ?? state.listId} — ${summary.completed}/${summary.total} completed`,
+		`${state.title ?? state.listId} - ${summary.completed}/${summary.total} completed`,
 		...state.todos.map((todo) => `${statusBox(todo.status)} ${todo.id}: ${todo.content}${todo.evidence ? `\n   evidence: ${todo.evidence}` : ""}`),
 	].join("\n");
 }
@@ -547,11 +547,11 @@ function statusBox(status: TodoStatus): string {
 function statusGlyph(status: TodoStatus): string {
 	switch (status) {
 		case "completed":
-			return "☑";
+			return "[x]";
 		case "in_progress":
-			return "◉";
+			return "[>]";
 		case "pending":
-			return "☐";
+			return "[ ]";
 	}
 }
 
