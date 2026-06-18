@@ -14,6 +14,9 @@ export { PLAN_STATE_CUSTOM_TYPE };
 const PLAN_TOOLS = new Set(["plan_ask", "grill_plan", "grill_done", "plan_write", "plan_exit"]);
 const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const TODO_TOOLS = ["todo_read", "todo_write"];
+/** customType for the one-line, display:false kick messages that drive A-class
+ * (turn_end) phase transitions. See advancePhase(). */
+const PLAN_KICK_CUSTOM_TYPE = "yuki-plan-flow-kick";
 
 type Phase = "idle" | "research" | "grilling" | "drafting" | "reviewing" | "revising" | "awaiting_approval" | "executing" | "aborted";
 
@@ -362,8 +365,12 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			const next = touch({ ...current, phase: "drafting" });
 			applyActiveTools(pi, next);
 			updatePlanUi(ctx, next);
+			// rev.3 B-class (tool-execute) transition: triggerTurn would degrade to steer here,
+			// so we do not start a new turn. The decisive result text guides the model to
+			// converge on plan_write within this turn; the narrowed tool set (plan_write only)
+			// takes effect on the next turn. block defends mid-turn if the model retries plan_ask.
 			return {
-				content: [{ type: "text" as const, text: `Grilling complete: ${params.summary}. Now call plan_write with the structured plan.` }],
+				content: [{ type: "text" as const, text: `Phase is now drafting. Grilling summary: ${params.summary}. Call plan_write with the structured plan.` }],
 				details: { state: next, summary: params.summary },
 			};
 		},
@@ -550,7 +557,11 @@ function buildGrillPlanResult(state: PlanFlowState): string {
 }
 
 function buildPlanWriteResult(state: PlanFlowState): string {
-	if (state.reviewPending) return `Plan draft '${state.title}' written. Automatic review is pending; wait for review steering before calling plan_exit.`;
+	// rev.3: positive, decisive B-class tool result. drafting plan_write is a
+	// tool-execute transition (streaming), so triggerTurn cannot start a clean new
+	// turn here; the decisive result text guides the model to converge (wait for
+	// review) within the current turn.
+	if (state.reviewPending) return `Plan draft '${state.title}' written. Automatic review is pending; wait for it before doing anything else.`;
 	return `Plan '${state.title}' written. Call plan_exit to request user approval.`;
 }
 
@@ -884,45 +895,80 @@ function buildKickoffMessage(state: PlanFlowState): string {
 	].join("\n");
 }
 
-function buildBlockedToolReason(state: PlanFlowState, toolName: string, allowed: string[], attempts: number): string {
-	const allowedList = allowed.join(", ");
-	if (attempts <= 1) {
-		return `yuki plan-flow: tool ${toolName} is not allowed during phase ${state.phase}. Allowed: ${allowedList}. ${nextActionHint(state)}`;
-	}
-	return `yuki plan-flow: STOP — ${toolName} is still blocked in phase ${state.phase} (rejected ${attempts}x in a row). The ONLY tool you may call now is: ${allowedList}. Call it exactly once and call nothing else; do not retry read/grep/ask/bash/edit.`;
+/** rev.3 P0-5: A-class (turn_end) phase transition helper.
+ *
+ * Persists the next state, narrows the active tool set, updates the UI, and triggers a
+ * clean new turn with a one-line `display:false` kick. The kick enters the LLM context
+ * (one short line) but not the visible transcript, so there is zero visible noise.
+ *
+ * Only valid from turn_end handlers (where `!isStreaming` so `triggerTurn` actually
+ * starts a new turn). Calling this from a tool `execute()` is a bug: tool execute runs
+ * inside the streaming turn loop, so `sendCustomMessage(triggerTurn)` silently degrades
+ * to a steer and does NOT start a clean narrowed turn (see rev.3 note, rev.3 §P0-5). For
+ * tool-execute transitions use a positive, decisive tool-result string instead.
+ */
+function advancePhase(pi: ExtensionAPI, ctx: ExtensionContext, next: PlanFlowState, kickContent: string, reason: PlanStateRecord["reason"] = "phase_change") {
+	persistPlanState(pi, next, reason);
+	applyActiveTools(pi, next); // takes effect on the next turn (the one we are about to start)
+	updatePlanUi(ctx, next);
+	pi.sendMessage(
+		{ customType: PLAN_KICK_CUSTOM_TYPE, content: kickContent, display: false },
+		{ triggerTurn: true },
+	);
+}
+
+/** Compact one-line research kickoff (display:false, used by advancePhase at /plan start). */
+function buildKickoffContent(state: PlanFlowState): string {
+	return `Start yuki plan-flow research for: ${state.request}. Inspect files read-only with read/grep/find/ls, then call grill_plan with critical decision questions.`;
+}
+
+function buildBlockedToolReason(state: PlanFlowState, _toolName: string, allowed: string[], _attempts: number): string {
+	// rev.3: positive, non-pressure wording. The blocked tool name is intentionally
+	// omitted so the model is not re-primed toward it. The consecutive-block counter
+	// is kept for telemetry only (consecutiveBlockedToolCalls) and no longer escalates
+	// into a "STOP ... rejected Nx" pressure message, which read as a deadloop in the
+	// incident. block is the only real-time mid-turn defense for B-class (tool-execute)
+	// transitions, so it stays first-class but calm.
+	const allowedList = allowed.length > 0 ? allowed.join(", ") : "(automatic review is running)";
+	return `yuki plan-flow: in phase ${state.phase}, the next tool to call is: ${allowedList}.`;
 }
 
 function nextActionHint(state: PlanFlowState): string {
-	if (state.phase === "research") return "Next action: inspect files read-only, then call grill_plan.";
-	if (state.phase === "grilling") return "Next action: use plan_ask only for unresolved critical questions, otherwise call grill_done.";
-	if (state.phase === "drafting") return "Next action: call plan_write exactly once and wait for automatic review steering.";
-	if (state.phase === "reviewing") return "Next action: wait; automatic review is running.";
-	if (state.phase === "revising") return "Next action: call plan_write with the required revisions.";
-	if (state.phase === "awaiting_approval") return "Next action: call plan_exit; do not call plan_write again unless the user explicitly requests a revision.";
-	if (state.phase === "executing") return `Next action: use todo_read/todo_write on ${state.todoListId ?? "the plan-owned todo list"}.`;
-	return "Next action: follow the yuki plan-flow phase prompt.";
+	if (state.phase === "research") return "Inspect files read-only, then call grill_plan.";
+	if (state.phase === "grilling") return "Call plan_ask for an unresolved critical question, or call grill_done to proceed.";
+	if (state.phase === "drafting") return "Call plan_write with the structured plan, then wait for automatic review.";
+	if (state.phase === "reviewing") return "Wait; automatic review is running.";
+	if (state.phase === "revising") return "Call plan_write with the revised plan.";
+	if (state.phase === "awaiting_approval") return "Call plan_exit to open the approval dialog.";
+	if (state.phase === "executing") return `Use todo_read/todo_write on ${state.todoListId ?? "the plan-owned todo list"}.`;
+	return "Follow the yuki plan-flow phase prompt.";
 }
 
 function buildPhasePrompt(state: PlanFlowState): string {
+	// rev.3: positive-only wording. Each branch says only what to call, never naming
+	// disallowed tools (naming them re-primes the model toward the very tool we are
+	// narrowing away — the root of the drafting plan_ask deadloop in the incident).
+	// Disallowed tools are removed from the model's tool set via setActiveTools at the
+	// turn boundary (A-class) or defended by tool_call block mid-turn (B-class).
 	if (state.phase === "research") {
-		return `[YUKI PLAN FLOW: research]\nYou are in read-only planning mode for request: ${state.request}\nInspect files only. Do not edit or run mutating commands. When ready, call grill_plan with only critical decision questions. Do not call plan_write yet.`;
+		return `[YUKI PLAN FLOW: research]\nRead-only planning mode for request: ${state.request}\nInspect files with read/grep/find/ls. When ready, call grill_plan with only critical decision questions.`;
 	}
 	if (state.phase === "grilling") {
-		return `[YUKI PLAN FLOW: grilling]\nAsk at most ${state.maxAskCount} critical decision questions total using plan_ask. Current count: ${state.askCount}. Do not ask facts you can inspect. Invalid resolutions are vague non-answers (e.g. 随便, 都行, 看情况, 之后再说, 无所谓, 不知道, whatever, TBD, idk) or punctuation-only replies. Call grill_done when ready to draft.`;
+		return `[YUKI PLAN FLOW: grilling]\nAsk at most ${state.maxAskCount} critical decision questions total using plan_ask. Current count: ${state.askCount}. Ask only decisions you cannot inspect in the repo. Valid resolutions are concrete (not 随便/都行/看情况/之后再说/无所谓/不知道/whatever/TBD/idk or punctuation-only). Call grill_done when ready to draft.`;
 	}
 	if (state.phase === "drafting") {
-		return "[YUKI PLAN FLOW: drafting]\nAllowed plan-flow tool: plan_write only. Call plan_write with structured steps exactly once, then stop and wait for automatic review steering. Do not call plan_ask, grill_plan, grill_done, or plan_exit in this phase.";
+		return "[YUKI PLAN FLOW: drafting]\nCall plan_write with the structured plan, then wait for the automatic review.";
 	}
 	if (state.phase === "revising") {
-		return "[YUKI PLAN FLOW: revising]\nAllowed plan-flow tool: plan_write only. Revise the plan according to review/user feedback by calling plan_write. Do not execute.";
+		return "[YUKI PLAN FLOW: revising]\nCall plan_write with the revised plan addressing the review feedback.";
 	}
 	if (state.phase === "awaiting_approval") {
-		return "[YUKI PLAN FLOW: awaiting approval]\nAllowed plan-flow tools: plan_exit, or plan_write only if the user explicitly requested a plan revision. Default next action is plan_exit. Do not implement before approval.";
+		return "[YUKI PLAN FLOW: awaiting approval]\nThe plan is ready; the approval dialog will open automatically. If asked, call plan_exit to open it.";
 	}
 	if (state.phase === "executing") {
 		return `[YUKI PLAN FLOW: executing]\nThe plan is approved. Use todo_read/todo_write to track progress for list ${state.todoListId}. Keep at most one in_progress and provide evidence for completed items.`;
 	}
-	return `[YUKI PLAN FLOW: ${state.phase}]\nFollow the yuki plan-flow tool discipline.`;
+	return `[YUKI PLAN FLOW: ${state.phase}]\nFollow the yuki plan-flow phase prompt.`;
 }
 
 function formatPlanStatus(state: PlanFlowState): string {
