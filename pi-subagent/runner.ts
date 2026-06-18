@@ -124,6 +124,7 @@ export function buildPiArgs(
   parentSessionPath: string | null,
   session: SubagentSessionDetails | undefined,
   persistentSessionDir: string | undefined,
+  callModel: string | undefined,
 ): string[] {
   const args: string[] = [
     "--mode",
@@ -149,8 +150,8 @@ export function buildPiArgs(
     args.push("--no-session");
   }
 
-  const model = agent.model ?? inheritedCliArgs.fallbackModel;
-  if (model) args.push("--model", model);
+  const effectiveModel = callModel ?? agent.model ?? inheritedCliArgs.fallbackModel;
+  if (effectiveModel) args.push("--model", effectiveModel);
 
   const thinking = agent.thinking ?? inheritedCliArgs.fallbackThinking;
   if (thinking) args.push("--thinking", thinking);
@@ -207,6 +208,8 @@ export interface RunAgentOptions {
   signal?: AbortSignal;
   /** Streaming update callback. */
   onUpdate?: OnUpdateCallback;
+  /** Optional per-call model override; wins over the agent's model and inherited fallback. */
+  callModel?: string;
   /** Factory to wrap results into SubagentDetails. */
   makeDetails: (results: SingleResult[]) => SubagentDetails;
 }
@@ -234,6 +237,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     preventCycles,
     signal,
     onUpdate,
+    callModel,
     makeDetails,
   } = opts;
 
@@ -271,7 +275,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       messages: [],
       stderr: message,
       usage: emptyUsage(),
-      model: agent.model,
+      model: callModel ?? agent.model,
       stopReason: "error",
       errorMessage: message,
     };
@@ -288,7 +292,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     messages: [],
     stderr: "",
     usage: emptyUsage(),
-    model: agent.model,
+    model: callModel ?? agent.model,
   };
 
   if (signal?.aborted) {
@@ -338,6 +342,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       parentSessionTmpPath,
       session,
       persistentSessionDir,
+      callModel,
     );
     let wasAborted = false;
 

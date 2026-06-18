@@ -274,17 +274,17 @@ test("buildPiArgs plans ephemeral and persistent session flags", async () => {
     };
 
     assert.deepEqual(
-      buildPiArgs(agent, null, "hello", "empty", null, undefined, undefined),
+      buildPiArgs(agent, null, "hello", "empty", null, undefined, undefined, undefined),
       ["--mode", "json", "-p", "--no-session", "hello"],
     );
 
     assert.deepEqual(
-      buildPiArgs(agent, null, "hello", "parent", "/tmp/parent.jsonl", undefined, undefined),
+      buildPiArgs(agent, null, "hello", "parent", "/tmp/parent.jsonl", undefined, undefined, undefined),
       ["--mode", "json", "-p", "--session", "/tmp/parent.jsonl", "hello"],
     );
 
     assert.deepEqual(
-      buildPiArgs(agent, null, "hello", "parent", "/tmp/parent.jsonl", session, undefined),
+      buildPiArgs(agent, null, "hello", "parent", "/tmp/parent.jsonl", session, undefined, undefined),
       [
         "--mode",
         "json",
@@ -308,8 +308,39 @@ test("buildPiArgs plans ephemeral and persistent session flags", async () => {
         "/tmp/parent.jsonl",
         { ...session, created: false, initialContextApplied: null },
         undefined,
+        undefined,
       ),
       ["--mode", "json", "-p", "--session-id", "subagent.abc123", "hello"],
+    );
+
+    // per-call model override wins over agent.model and inherited fallback
+    assert.deepEqual(
+      buildPiArgs(
+        { ...agent, model: "agent-default" },
+        null,
+        "hello",
+        "empty",
+        null,
+        undefined,
+        undefined,
+        "cheap-flash",
+      ),
+      ["--mode", "json", "-p", "--no-session", "--model", "cheap-flash", "hello"],
+    );
+
+    // agent.model used when no per-call override
+    assert.deepEqual(
+      buildPiArgs(
+        { ...agent, model: "agent-default" },
+        null,
+        "hello",
+        "empty",
+        null,
+        undefined,
+        undefined,
+        undefined,
+      ),
+      ["--mode", "json", "-p", "--no-session", "--model", "agent-default", "hello"],
     );
   } finally {
     cleanup();

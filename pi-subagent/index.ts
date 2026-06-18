@@ -78,6 +78,9 @@ const CallItem = Type.Object({
       description: getCallFieldSchemaDescription("session"),
     }),
   ),
+  model: Type.Optional(
+    Type.String({ description: getCallFieldSchemaDescription("model") }),
+  ),
 });
 
 const SubagentParams = Type.Object({
@@ -111,6 +114,7 @@ interface NormalizedCall {
   initialContext: InitialContext;
   sessionHandle?: string;
   session?: SubagentSessionDetails;
+  model?: string;
 }
 
 interface NormalizedCallsResult {
@@ -391,6 +395,14 @@ function normalizeCalls(rawCalls: unknown, defaultCwd: string): NormalizedCallsR
       }
     }
 
+    let callModel: string | undefined;
+    if (call.model !== undefined) {
+      if (typeof call.model !== "string" || call.model.trim().length === 0) {
+        return { error: `calls[${index}].model must be a non-empty string when provided.` };
+      }
+      callModel = call.model.trim();
+    }
+
     calls.push({
       index,
       agent,
@@ -398,6 +410,7 @@ function normalizeCalls(rawCalls: unknown, defaultCwd: string): NormalizedCallsR
       effectiveCwd,
       initialContext,
       sessionHandle,
+      model: callModel,
     });
   }
 
@@ -878,6 +891,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             prompt: call.prompt,
             callCwd: call.effectiveCwd,
             initialContext: call.initialContext,
+            callModel: call.model,
             parentSessionSnapshotJsonl,
             session: call.session,
             persistentSessionDir,

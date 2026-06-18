@@ -16,7 +16,7 @@ export interface DelegationGuardSummary {
 }
 
 interface CallFieldContract {
-  name: "agent" | "prompt" | "cwd" | "initialContext" | "session";
+  name: "agent" | "prompt" | "cwd" | "initialContext" | "session" | "model";
   required: boolean;
   schemaDescription: string;
   promptDescription: string;
@@ -60,6 +60,14 @@ export const CALL_FIELDS: CallFieldContract[] = [
     promptDescription:
       "durable conversation handle. If present, the call continues or creates a persistent child Pi session. The handle is scoped by parent session, effective cwd, and agent name. The same handle used with different agents resolves to different sessions. Requires a persisted parent Pi session",
   },
+  {
+    name: "model",
+    required: false,
+    schemaDescription:
+      "Optional model id override for this call. Takes precedence over the agent's configured model and the parent's inherited --model. Useful for routing a single delegation to a cheaper or stronger model without changing agent defaults",
+    promptDescription:
+      "optional model id override for this call; wins over the agent's model and the inherited parent --model when provided",
+  },
 ];
 
 export function getCallFieldSchemaDescription(name: CallFieldContract["name"]): string {
@@ -86,7 +94,7 @@ function formatDelegationRules(): string {
 }
 
 export function formatSubagentUsageExample(): string {
-  return `Use exactly one top-level \`calls\` array:\n\`\`\`json\n{\n  "calls": [\n    {\n      "agent": "agent-name",\n      "prompt": "Prompt sent verbatim to the subagent",\n      "initialContext": "empty",\n      "session": "optional-logical-handle"\n    }\n  ]\n}\n\`\`\``;
+  return `Use exactly one top-level \`calls\` array:\n\`\`\`json\n{\n  "calls": [\n    {\n      "agent": "agent-name",\n      "prompt": "Prompt sent verbatim to the subagent",\n      "initialContext": "empty",\n      "session": "optional-logical-handle",\n      "model": "optional-model-id-override"\n    }\n  ]\n}\n\`\`\``;
 }
 
 export function formatSubagentUsageErrorExample(): string {
