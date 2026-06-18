@@ -19,6 +19,8 @@ pi -e git:github.com/YukiagoTpf/yuki-pi
 - `extensions/ask-user-question.ts` — `ask_user_question` tool for structured user Q&A.
 - `extensions/btw.ts` — `/btw` one-shot side-question command.
 - `extensions/recap.ts` — `/recap` one-sentence session progress recap.
+- `extensions/yuki-compaction.ts` — structured long-session compaction with pruning, archives, pinned state, and proactive triggers.
+- `extensions/codex-usage-status.ts` — footer status for Codex/Codex Spark usage windows, adapted from `@calesennett/pi-codex-usage`.
 - `extensions/enable-grep.ts` — enables Pi's built-in `grep` tool.
 - `extensions/todo/index.ts` — standalone branch-safe `todo_write` / `todo_clear` / `todo_read` tools and `/todos` command.
 - `extensions/plan-flow/index.ts` — `/plan` workflow: read-only research, grilling, automatic review, approval via `plan_exit`, final plan file, and plan-owned todo seeding.
@@ -49,6 +51,42 @@ The standalone todo module provides:
 - `/todos clear [completed|all] [listId]` — clear standalone todos from the current/default or named list.
 
 It works without `/plan`. Plan-flow seeds a plan-owned todo list via the exported todo state helpers; plan-owned lists apply stricter policy such as a single `in_progress` item and required evidence for completed items. Plan-owned and workflow todo lists cannot be cleared with `todo_clear` because they are execution records.
+
+## Codex Usage Status
+
+Adapted from [`@calesennett/pi-codex-usage`](https://github.com/calesennett/pi-codex-usage), this extension shows Codex usage in the footer when `openai-codex` OAuth credentials are present in Pi's `auth.json`.
+
+Commands:
+
+- `/codex-usage-mode` — toggle display mode between percent `left` and percent `used`.
+- `/codex-usage-mode left|used` — set display mode explicitly.
+- `/codex-usage-reset-window` — toggle reset countdown between `7d` and `5h`.
+- `/codex-usage-reset-window 7d|5h` — set reset countdown window explicitly.
+
+Preferences are stored in Pi's `settings.json` under `pi-codex-usage`.
+
+## Yuki Compaction
+
+The compaction extension customizes Pi's `session_before_compact` flow for long-running coding sessions:
+
+- pre-store pruning for very large tool outputs, with full text archived under `.pi/yuki/tool-output/`;
+- runtime tool-output pruning before LLM calls;
+- structured compaction summaries with pinned goal, constraints, plan/todo progress, decisions, and working memory;
+- branch-aware state snapshots in `CompactionResult.details` plus non-compaction delta entries;
+- proactive `ctx.compact()` hysteresis on `turn_end` / `agent_end`.
+
+Commands:
+
+- `/yuki-compact` — open the interactive TUI settings menu.
+- `/compact` — when Yuki is enabled, Pi's built-in compact command is intercepted and produces the Yuki structured compaction.
+- `/yuki-compact status` — show current branch config and compaction state.
+- `/yuki-compact now` — compatibility manual trigger; in normal TUI use `/compact` instead.
+- `/yuki-compact on|off` — enable or disable the Yuki override for Pi's built-in `/compact` on the branch.
+- `/yuki-compact proactive on|off` — enable or disable proactive `ctx.compact()` triggers.
+- `/yuki-compact model auto|<provider/model>` — choose summarizer model preference, like `/model` but only for compaction.
+- `/yuki-compact set trigger <ratio>` / `target-free <ratio>` / `archive-chars <n>` / `runtime-chars <n>` / `min-interval-ms <n>` — tune thresholds without opening the menu.
+- `/yuki-compact reset` — restore defaults.
+- `/yuki-compact-now` and `/yuki-compact-status` remain as compatibility aliases.
 
 ## Recap
 
