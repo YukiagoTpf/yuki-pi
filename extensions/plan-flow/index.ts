@@ -5,7 +5,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { createTodoState, makeTodoStateRecord } from "../todo/index.ts";
+import { createTodoState, makeTodoStateRecord, reconstructTodoStates } from "../todo/index.ts";
 import { PLAN_STATE_CUSTOM_TYPE, TODO_STATE_CUSTOM_TYPE } from "../shared/constants.ts";
 import { isExecutableResolution, parsePlanCommandArgs, slugify } from "../shared/plan-helpers.ts";
 
@@ -18,7 +18,7 @@ const TODO_TOOLS = ["todo_read", "todo_write"];
  * (turn_end) phase transitions. See advancePhase(). */
 const PLAN_KICK_CUSTOM_TYPE = "yuki-plan-flow-kick";
 
-type Phase = "idle" | "research" | "grilling" | "drafting" | "reviewing" | "revising" | "awaiting_approval" | "executing" | "aborted";
+type Phase = "idle" | "research" | "grilling" | "drafting" | "reviewing" | "revising" | "awaiting_approval" | "executing" | "completed" | "aborted";
 
 interface PlanStep {
 	id: string;
@@ -268,6 +268,29 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("plan-debug", {
+		description: "Show yuki plan-flow phase, allowed tools, and next action (debug aid)",
+		handler: async (_args, ctx) => {
+			const state = reconstructPlanState(ctx);
+			if (!state?.active || state.phase === "aborted") {
+				ctx.ui.notify("No active yuki plan.", "info");
+				return;
+			}
+			const allowed = getAllowedToolsForState(state);
+			ctx.ui.notify(
+				[
+					`Plan ${state.planId}`,
+					`Phase: ${state.phase}`,
+					`Allowed tools: ${allowed.join(", ") || "(none)"}`,
+					`Next action: ${nextActionHint(state)}`,
+					`Todo list: ${state.todoListId ?? "(none)"}`,
+					`Review: ${state.reviewSkipped ? `skipped (${state.reviewSkippedReason})` : state.reviewed ? "completed" : state.reviewPending ? "pending" : "not completed"}`,
+				].join("\n"),
+				"info",
+			);
+		},
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		const state = reconstructPlanState(ctx);
 		if (state?.active && state.phase !== "aborted") {
@@ -338,6 +361,22 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			await drivePostReview(pi, ctx, reviewed);
 		} finally {
 			reviewInFlight = false;
+		}
+	});
+
+	// rev.3 P1-1: auto-close a plan once its plan-owned todo list is fully completed.
+	// This is an A-class transition (turn has ended, !isStreaming). Without it, a
+	// completed plan stays active/executing and blocks new /plan until /plan-abort
+	// (incident #4). Also enriches the executing widget with the in_progress todo.
+	pi.on("turn_end", async (_event, ctx) => {
+		const state = reconstructPlanState(ctx);
+		if (!state?.active || state.phase !== "executing" || !state.todoListId) return;
+		const todoStates = reconstructTodoStates(ctx);
+		const todoState = todoStates.get(state.todoListId);
+		if (!todoState || todoState.todos.length === 0) return;
+		updateExecutingWidget(ctx, state, todoState);
+		if (todoState.todos.every((todo) => todo.status === "completed")) {
+			await closePlan(pi, ctx, state);
 		}
 	});
 
@@ -815,6 +854,33 @@ async function abortPlan(pi: ExtensionAPI, ctx: ExtensionContext, state: PlanFlo
 	return aborted;
 }
 
+/** rev.3 P1-1: close a plan whose plan-owned todo list is fully completed. Restores
+ * the user's original active tool set, clears the plan UI, and records a `completed`
+ * snapshot so a new /plan is not blocked by a stale active plan (incident #4). */
+async function closePlan(pi: ExtensionAPI, ctx: ExtensionContext, state: PlanFlowState): Promise<PlanFlowState> {
+	const closed = touch({ ...state, active: false, phase: "completed" });
+	persistPlanState(pi, closed, "phase_change");
+	pi.setActiveTools(state.previousActiveTools);
+	ctx.ui.setStatus("yuki-plan", undefined);
+	ctx.ui.setWidget("yuki-plan", undefined);
+	if (ctx.hasUI) ctx.ui.notify(`yuki plan ${state.planId} completed · all todos done.`, "info");
+	return closed;
+}
+
+/** rev.3 P1-2: enrich the executing widget with the current in_progress todo so the
+ * user can see live progress without running /plan-debug. */
+function updateExecutingWidget(ctx: ExtensionContext, state: PlanFlowState, todoState: { todos: Array<{ status: string; id: string; content: string; activeForm: string }> }): void {
+	if (!ctx.hasUI) return;
+	const completed = todoState.todos.filter((todo) => todo.status === "completed").length;
+	const total = todoState.todos.length;
+	const inProgress = todoState.todos.find((todo) => todo.status === "in_progress");
+	const lines = [`Plan executing · ${completed}/${total} done · list ${state.todoListId ?? "?"}`];
+	if (inProgress) lines.push(`▶ ${inProgress.id}: ${inProgress.activeForm || inProgress.content}`);
+	else if (completed === total) lines.push("All steps completed.");
+	else lines.push("Next: pick the next pending step with todo_write.");
+	ctx.ui.setWidget("yuki-plan", lines);
+}
+
 type ApprovalOutcome =
 	| { kind: "approved"; state: PlanFlowState }
 	| { kind: "revising"; state: PlanFlowState; revisionReason: string }
@@ -1023,9 +1089,15 @@ function updatePlanUi(ctx: ExtensionContext, state: PlanFlowState) {
 		ctx.ui.setWidget("yuki-plan", undefined);
 		return;
 	}
-	if (state.phase === "executing") {
-		ctx.ui.setStatus("yuki-plan", undefined);
-		ctx.ui.setWidget("yuki-plan", undefined);
+	if (state.phase === "executing" || state.phase === "completed") {
+		ctx.ui.setStatus("yuki-plan", state.phase === "executing" ? `plan executing · ${state.todoListId ?? ""}` : undefined);
+		if (state.phase === "completed") {
+			ctx.ui.setWidget("yuki-plan", undefined);
+		} else {
+			// Show a minimal executing widget; the turn_end handler enriches it with
+			// the in_progress todo via updateExecutingWidget once todo state is read.
+			ctx.ui.setWidget("yuki-plan", [`Plan executing · list ${state.todoListId ?? "?"}`, "Use /plan-debug for details."]);
+		}
 		return;
 	}
 	ctx.ui.setStatus("yuki-plan", `plan ${state.phase}`);

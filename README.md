@@ -34,12 +34,15 @@ The `ask_user_question` tool lets the model pause to ask one user-facing questio
 
 The plan-flow module provides:
 
-- `/plan <request>` — enter read-only planning mode for a requested change.
+- `/plan [--context <token>] <request>` — enter read-only planning mode for a requested change. `--context <token>` loads structured planning constraints (profiles, mandatory validation, declared files) from a one-shot `.pi/plan-context/<token>.json` handoff file written by callers like `/ta-dev`, so constraints do not have to be serialized into the visible prompt.
 - `grill_plan`, `plan_ask`, `grill_done` — record and resolve at most five critical planning questions before drafting.
-- `plan_write` — write a structured plan draft and render `.pi/plan-draft-<planId>.md`.
-- Automatic review — after draft `plan_write`, the current model reviews the plan once; blocking issues return the flow to revision, otherwise it proceeds to approval.
-- `plan_exit` — request user approval; approval promotes the plan to `docs/plan-<slug>-<planId>.md` and seeds a plan-owned todo list.
-- `/plan-status` and `/plan-abort`.
+- `plan_write` — write a structured plan draft and render `.pi/plan-draft-<planId>.md`. When a planning context declares mandatory validation, `plan_write` enforces that the union of all steps' `validation` covers every mandatory sensor.
+- Automatic review — after draft `plan_write`, the current model reviews the plan once; blocking issues return the flow to revision, otherwise the approval dialog opens automatically (no need to call `plan_exit` manually in interactive sessions).
+- `plan_exit` — request user approval (also used as the headless fallback); approval promotes the plan to `docs/plan-<slug>-<planId>.md` and seeds a plan-owned todo list, then automatically starts the execution turn.
+- A plan auto-closes once all its plan-owned todos are completed, freeing `/plan` for a new run.
+- `/plan-status`, `/plan-debug` (phase / allowed tools / next action), and `/plan-abort`.
+
+Phase transitions that need a clean, tool-narrowed turn fire a `display:false` kick from `turn_end` (A-class); transitions inside a tool `execute()` (B-class) cannot start a new turn mid-stream, so they rely on decisive tool-result text plus the `tool_call` block as the mid-turn defense. Phase prompts are positive-only (they say what to call, never naming disallowed tools).
 
 ## Todo
 
