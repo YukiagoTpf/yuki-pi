@@ -98,13 +98,14 @@ function formatEffort(level: string): string {
 
 function formatContext(ctx: ExtensionContext, theme: Theme): string {
 	const usage = ctx.getContextUsage();
-	if (!usage || usage.tokens === null) return theme.fg("dim", `ctx --% ${"▱".repeat(BAR_WIDTH)}`);
+	if (!usage || usage.tokens === null) return theme.fg("dim", `ctx --%/${formatTokens(usage?.contextWindow ?? ctx.model?.contextWindow ?? 0)} ${"▱".repeat(BAR_WIDTH)}`);
 
+	const contextWindow = usage.contextWindow || ctx.model?.contextWindow || 0;
 	const percent = Math.max(0, Math.min(100, usage.percent ?? (usage.tokens / usage.contextWindow) * 100));
 	const filled = Math.max(0, Math.min(BAR_WIDTH, Math.round((percent / 100) * BAR_WIDTH)));
 	const empty = BAR_WIDTH - filled;
 	const color = percent >= 85 ? "error" : percent >= 65 ? "warning" : "success";
-	return theme.fg("dim", `ctx ${Math.round(percent)}% `) + theme.fg(color, "▰".repeat(filled)) + theme.fg("dim", "▱".repeat(empty));
+	return theme.fg("dim", `ctx ${Math.round(percent)}%/${formatTokens(contextWindow)} `) + theme.fg(color, "▰".repeat(filled)) + theme.fg("dim", "▱".repeat(empty));
 }
 
 function formatTokenStats(ctx: ExtensionContext, theme: Theme): string | undefined {

@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { completions, parseChoice, preferenceCommands, type PreferenceCommand } from "../src/codex-usage/commands.ts";
 import { formatStatus, unavailableStatus } from "../src/codex-usage/format.ts";
 import { loadPreferences, savePreferences, SETTINGS_FILE } from "../src/codex-usage/preferences.ts";
-import { DEFAULT_PREFERENCES, errorMessage, type Preferences, type UsageSnapshot } from "../src/codex-usage/domain.ts";
+import { DEFAULT_PREFERENCES, errorMessage, isCodexModel, type Preferences, type UsageSnapshot } from "../src/codex-usage/domain.ts";
 import { getUsage, MISSING_AUTH_ERROR } from "../src/codex-usage/usage.ts";
 
 const EXTENSION_ID = "codex-usage";
@@ -22,7 +22,7 @@ class CodexUsageStatus {
 	public constructor(private readonly pi: ExtensionAPI) {
 		pi.on("session_start", (_event, ctx) => this.start(ctx));
 		pi.on("turn_end", (_event, ctx) => void this.refresh(ctx));
-		pi.on("model_select", (event, ctx) => void this.refresh(ctx, event.model.id));
+		pi.on("model_select", (event, ctx) => void this.onModelSelect(ctx, event.model.id));
 		pi.on("session_shutdown", (_event, ctx) => this.stop(ctx));
 
 		for (const command of preferenceCommands) this.registerPreferenceCommand(command);
@@ -77,7 +77,19 @@ class CodexUsageStatus {
 		}
 	}
 
+	private onModelSelect(ctx: ExtensionContext, modelId: string): void {
+		if (!isCodexModel(modelId)) {
+			if (this.timer) clearInterval(this.timer);
+			this.timer = undefined;
+			this.lastUsage = undefined;
+			if (ctx.hasUI) ctx.ui.setStatus(EXTENSION_ID, undefined);
+			return;
+		}
+		void this.refresh(ctx, modelId);
+	}
+
 	private async refresh(ctx = this.ctx, modelId = ctx?.model?.id, generation = this.generation): Promise<void> {
+		if (modelId && !isCodexModel(modelId)) return;
 		if (!ctx?.hasUI || !this.isCurrent(generation)) return;
 
 		if (this.inFlight) {
@@ -108,7 +120,7 @@ class CodexUsageStatus {
 	}
 
 	private renderLast(ctx: ExtensionContext): boolean {
-		if (!ctx.hasUI || !this.lastUsage) return false;
+		if (!ctx.hasUI || !this.lastUsage || !isCodexModel(ctx.model?.id)) return false;
 		ctx.ui.setStatus(EXTENSION_ID, formatStatus(ctx, this.lastUsage, this.preferences, ctx.model?.id));
 		return true;
 	}

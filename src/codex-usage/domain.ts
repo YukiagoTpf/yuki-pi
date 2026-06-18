@@ -32,6 +32,12 @@ export type UsageSnapshot = {
 export const DEFAULT_PREFERENCES = { usageMode: "left", refreshWindow: "7d" } satisfies Preferences;
 export const SPARK_MODEL_ID = "gpt-5.3-codex-spark";
 
+const CODEX_MODEL_PREFIX = "gpt-5.3-codex";
+
+export function isCodexModel(modelId: string | undefined): boolean {
+	return !!modelId && modelId.startsWith(CODEX_MODEL_PREFIX);
+}
+
 export const windows = {
 	"5h": { label: "5h:", field: "primary_window" },
 	"7d": { label: "7d:", field: "secondary_window" },
