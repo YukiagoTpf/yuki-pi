@@ -198,10 +198,14 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			state.draftPath = `.pi/plan-draft-${state.planId}.md`;
 			state.currentActiveTools = getAllowedToolsForState(state);
 
-			persistPlanState(pi, state, "plan_start");
-			applyActiveTools(pi, state);
-			updatePlanUi(ctx, state);
-			pi.sendUserMessage(buildKickoffMessage(state));
+			// rev.3 P0-1: drive the first turn with a display:false kick instead of a
+			// visible sendUserMessage. The command handler itself does not start a turn
+			// (slash commands execute and return without prompting), and at this point the
+			// agent is not streaming, so advancePhase's sendMessage(triggerTurn) starts a
+			// clean, narrowed research turn with zero visible noise. The detailed research
+			// instructions come from before_agent_start -> buildPhasePrompt (research).
+			ctx.ui.notify(`yuki plan-flow started · phase: research · plan ${state.planId}`, "info");
+			advancePhase(pi, ctx, state, buildKickoffContent(state), "plan_start");
 		},
 	});
 
@@ -881,18 +885,6 @@ function updatePlanUi(ctx: ExtensionContext, state: PlanFlowState) {
 	} else {
 		ctx.ui.setWidget("yuki-plan", [`Plan ${state.planId}`, `Phase: ${state.phase}`, `Request: ${state.request}`]);
 	}
-}
-
-function buildKickoffMessage(state: PlanFlowState): string {
-	return [
-		`Start yuki plan-flow for this request: ${state.request}`,
-		"",
-		"First do read-only research using available read/grep/find/ls tools.",
-		"Do not modify files yet.",
-		"When you have enough context, call grill_plan with only critical decision questions.",
-		"Use plan_ask for unresolved critical questions, then grill_done, then plan_write.",
-		"After automatic review/revision, call plan_exit to request user approval before implementation.",
-	].join("\n");
 }
 
 /** rev.3 P0-5: A-class (turn_end) phase transition helper.
