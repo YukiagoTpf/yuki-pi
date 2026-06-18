@@ -298,7 +298,11 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			persistPlanState(pi, reviewed, reviewed.reviewSkipped ? "review_skipped" : "review_complete");
 			applyActiveTools(pi, reviewed);
 			updatePlanUi(ctx, reviewed);
-			pi.sendUserMessage(buildReviewSteeringMessage(reviewed), { deliverAs: "steer" });
+			// rev.3 P0-3/P0-4: drive approval directly from here. The turn has ended
+			// (!isStreaming), so this is an A-class transition point and kickTurn's
+			// triggerTurn actually starts a clean, narrowed next turn. The old
+			// sendUserMessage(steer) that produced visible noise is gone.
+			await drivePostReview(pi, ctx, reviewed);
 		} finally {
 			reviewInFlight = false;
 		}
@@ -435,42 +439,40 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			if (!current?.active || current.phase === "aborted") throw new Error("plan_exit: no active yuki plan.");
 			if (current.phase !== "awaiting_approval") throw new Error(`plan_exit: plan is not awaiting approval (phase=${current.phase}). Call plan_write first.`);
 			if (current.steps.length === 0) throw new Error("plan_exit: current plan has no steps.");
-			if (!ctx.hasUI) throw new Error("plan_exit: interactive UI is required for approval.");
 
-			const choice = await ctx.ui.select(params.message ?? `Approve yuki plan '${current.title ?? current.planId}'?`, [
-				"Approve",
-				"Request revision",
-				"Cancel",
-			]);
-
-			if (choice === "Cancel" || choice === undefined) {
-				const aborted = await abortPlan(pi, ctx, current, "cancelled during approval");
-				return { content: [{ type: "text" as const, text: "Plan cancelled by user." }], details: { state: aborted } };
-			}
-
-			if (choice === "Request revision") {
-				const reason = (await ctx.ui.editor("Revision reason", ""))?.trim() || "User requested revision.";
-				const next = touch({ ...current, phase: "revising" });
-				applyActiveTools(pi, next);
-				updatePlanUi(ctx, next);
+			// rev.3 P0-3/P0-4: plan_exit runs inside a tool execute() (streaming), so it is
+			// a B-class transition point — triggerTurn would degrade to a steer here. We do
+			// NOT kick a new turn; instead the decisive tool-result text guides the model to
+			// converge (approve -> todo_write, revising -> plan_write) within this turn. The
+			// narrowed tool set takes effect on the next turn.
+			if (!ctx.hasUI) {
+				// Headless/programmatic (E2E, cron): no dialog available. Auto-approve so
+			// plan-flow can proceed — running /plan in a headless context already implies
+			// intent to execute. Interactive confirmation is the hasUI path below.
+				const approved = await approvePlan(pi, ctx, current);
+				persistPlanState(pi, approved, "approval");
+				applyActiveTools(pi, approved);
+				updatePlanUi(ctx, approved);
 				return {
-					content: [{ type: "text" as const, text: `User requested revision: ${reason}\nRevise the plan with plan_write.` }],
-					details: { state: next, revisionReason: reason },
+					content: [{ type: "text" as const, text: `Plan auto-approved (headless) and saved to ${approved.finalPath}. A plan-owned todo list '${approved.todoListId}' was created. Begin execution with todo_write on the first step.` }],
+					details: { state: approved },
 				};
 			}
 
-			const approved = await approvePlan(pi, ctx, current);
-			applyActiveTools(pi, approved);
-			updatePlanUi(ctx, approved);
-
+			const outcome = await runApprovalDialog(pi, ctx, current, params.message);
+			if (outcome.kind === "cancelled") {
+				return { content: [{ type: "text" as const, text: "Plan cancelled by user." }], details: { state: outcome.state } };
+			}
+			if (outcome.kind === "revising") {
+				return {
+					content: [{ type: "text" as const, text: `User requested revision: ${outcome.revisionReason}\nCall plan_write with the revised plan.` }],
+					details: { state: outcome.state, revisionReason: outcome.revisionReason },
+				};
+			}
+			// approved (B-class): decisive result guides the model to start todo_write.
 			return {
-				content: [
-					{
-						type: "text" as const,
-						text: `Plan approved and saved to ${approved.finalPath}. A plan-owned todo list '${approved.todoListId}' was created. Begin execution with todo_write progress updates.`,
-					},
-				],
-				details: { state: approved },
+				content: [{ type: "text" as const, text: `Plan approved and saved to ${outcome.state.finalPath}. A plan-owned todo list '${outcome.state.todoListId}' was created. Begin execution with todo_write on the first step.` }],
+				details: { state: outcome.state },
 			};
 		},
 		renderCall(_args, theme) {
@@ -654,15 +656,15 @@ function parseReviewFeedback(raw: string): ReviewFeedback {
 	}
 }
 
-function buildReviewSteeringMessage(state: PlanFlowState): string {
-	if (state.reviewSkipped) {
-		return `Automatic review was skipped: ${state.reviewSkippedReason}. Next action: call plan_exit for user approval and clearly mention the plan was not automatically reviewed. Do not call plan_write again unless the user explicitly requests a revision.`;
-	}
-	if (state.phase === "revising") {
-		const issues = state.reviewFeedback?.blockingIssues.map((issue, index) => `${index + 1}. ${issue.stepId ? `[${issue.stepId}] ` : ""}${issue.issue}${issue.suggestion ? ` Suggestion: ${issue.suggestion}` : ""}`).join("\n") ?? "Review requested changes.";
-		return `Automatic review found blocking issues. Revise the plan with plan_write; do not execute yet.\n${issues}`;
-	}
-	return `Automatic review passed: ${state.reviewFeedback?.summary ?? "no blocking issues"}. Next action: call plan_exit to request user approval. Do not call plan_write again unless the user explicitly requests a revision; do not execute yet.`;
+/** rev.3 P0-3: format review blocking issues for the revising kick content. The kick
+ * is display:false (not in the visible transcript) but enters the LLM context, so the
+ * model sees what to fix. The old buildReviewSteeringMessage carried this via a visible
+ * sendUserMessage steer; that path is gone, so the issues ride the kick instead. */
+function formatReviewIssues(state: PlanFlowState): string {
+	if (state.reviewSkipped) return `Automatic review was skipped: ${state.reviewSkippedReason ?? "unknown reason"}.`;
+	const issues = state.reviewFeedback?.blockingIssues;
+	if (!issues || issues.length === 0) return "Review requested changes.";
+	return issues.map((issue, index) => `${index + 1}. ${issue.stepId ? `[${issue.stepId}] ` : ""}${issue.issue}${issue.suggestion ? ` Suggestion: ${issue.suggestion}` : ""}`).join("\n");
 }
 
 function reconstructPlanState(ctx: ExtensionContext): PlanFlowState | undefined {
@@ -761,6 +763,93 @@ async function abortPlan(pi: ExtensionAPI, ctx: ExtensionContext, state: PlanFlo
 		await unlink(resolve(ctx.cwd, state.draftPath)).catch(() => undefined);
 	}
 	return aborted;
+}
+
+type ApprovalOutcome =
+	| { kind: "approved"; state: PlanFlowState }
+	| { kind: "revising"; state: PlanFlowState; revisionReason: string }
+	| { kind: "cancelled"; state: PlanFlowState };
+
+/** rev.3 P0-3: the shared approval dialog used by both the automatic (turn_end)
+ * path and the plan_exit tool. Shows Approve / Request revision / Cancel, performs
+ * the state transition (approvePlan / revising / abortPlan), persists, narrows tools,
+ * and updates the UI. Returns the outcome; the caller decides how to drive the next
+ * turn (A-class turn_end callers use kickTurn; B-class plan_exit returns a tool result).
+ *
+ * Requires ctx.hasUI — callers must branch on hasUI first. */
+async function runApprovalDialog(pi: ExtensionAPI, ctx: ExtensionContext, current: PlanFlowState, message?: string): Promise<ApprovalOutcome> {
+	if (!ctx.hasUI) throw new Error("runApprovalDialog: interactive UI is required for approval.");
+	if (current.steps.length === 0) throw new Error("runApprovalDialog: current plan has no steps.");
+
+	const choice = await ctx.ui.select(message ?? `Approve yuki plan '${current.title ?? current.planId}'?`, [
+		"Approve",
+		"Request revision",
+		"Cancel",
+	]);
+
+	if (choice === "Cancel" || choice === undefined) {
+		const aborted = await abortPlan(pi, ctx, current, "cancelled during approval");
+		return { kind: "cancelled", state: aborted };
+	}
+
+	if (choice === "Request revision") {
+		const reason = (await ctx.ui.editor("Revision reason", ""))?.trim() || "User requested revision.";
+		const next = touch({ ...current, phase: "revising" });
+		persistPlanState(pi, next, "phase_change");
+		applyActiveTools(pi, next);
+		updatePlanUi(ctx, next);
+		return { kind: "revising", state: next, revisionReason: reason };
+	}
+
+	const approved = await approvePlan(pi, ctx, current);
+	persistPlanState(pi, approved, "approval");
+	applyActiveTools(pi, approved);
+	updatePlanUi(ctx, approved);
+	return { kind: "approved", state: approved };
+}
+
+/** rev.3 P0-3/P0-4: drive the post-review flow from the turn_end handler (A-class).
+ *
+ * `state` has already been persisted/narrowed/UI-updated by the caller (the review
+ * turn_end handler) for the reviewing->revising/awaiting_approval transition, so here
+ * we only drive the next turn. For the approved branch we additionally run the dialog
+ * (which re-persists the executing state) and then kickTurn the execution turn. */
+async function drivePostReview(pi: ExtensionAPI, ctx: ExtensionContext, state: PlanFlowState): Promise<void> {
+	if (state.phase === "revising") {
+		const issueCount = state.reviewFeedback?.blockingIssues.length ?? 0;
+		if (ctx.hasUI) ctx.ui.notify(`Automatic review found ${issueCount} blocking issue(s); revising.`, "warning");
+		// state already persisted/narrowed/UI-updated for revising. The kick is
+		// display:false (zero visible noise) but enters the LLM context, so it carries
+		// the blocking issues the model must address — replacing the old visible steer.
+		kickTurn(pi, `Address the automatic review feedback and call plan_write with the revised plan.\nBlocking issues:\n${formatReviewIssues(state)}`);
+		return;
+	}
+
+	// phase === awaiting_approval (review passed or skipped)
+	if (ctx.hasUI) {
+		// Direct approval dialog — no visible steering text, no need for the model to
+		// call plan_exit. hasUI guard: headless falls through to the else branch.
+		const outcome = await runApprovalDialog(pi, ctx, state);
+		if (outcome.kind === "approved") {
+			ctx.ui.notify(`Plan approved · ${outcome.state.finalPath ?? ""}`, "info");
+			// A-class: state is executing (persisted/narrowed by runApprovalDialog);
+			// kick a clean execution turn so the model starts todo_write without the
+			// user having to say "continue".
+			kickTurn(pi, "Plan approved. Begin execution: todo_write the first step as in_progress.");
+			return;
+		}
+		if (outcome.kind === "revising") {
+			// runApprovalDialog already persisted/narrowed/UI-updated revising.
+			kickTurn(pi, "Address the revision request and call plan_write with the revised plan.");
+			return;
+		}
+		// cancelled: abortPlan already persisted + cleared UI; no turn to kick.
+		return;
+	}
+
+	// Headless (no UI): cannot show a dialog. Kick a turn so the model calls
+	// plan_exit, whose headless branch auto-approves (see plan_exit execute).
+	kickTurn(pi, "Plan is ready for approval; call plan_exit to approve it.");
 }
 
 async function renderDraft(ctx: ExtensionContext, state: PlanFlowState) {
@@ -887,6 +976,20 @@ function updatePlanUi(ctx: ExtensionContext, state: PlanFlowState) {
 	}
 }
 
+/** rev.3 P0-5: trigger a clean new turn with a one-line, display:false kick.
+ *
+ * `display:false` keeps the kick out of the visible transcript (zero visible noise);
+ * the one-line content still enters the LLM context. Only fires a real new turn when
+ * the agent is not streaming, so this is only correct from turn_end handlers (A-class
+ * transition points). Inside a tool execute() the agent is streaming and triggerTurn
+ * silently degrades to a steer — see advancePhase doc. */
+function kickTurn(pi: ExtensionAPI, content: string) {
+	pi.sendMessage(
+		{ customType: PLAN_KICK_CUSTOM_TYPE, content, display: false },
+		{ triggerTurn: true },
+	);
+}
+
 /** rev.3 P0-5: A-class (turn_end) phase transition helper.
  *
  * Persists the next state, narrows the active tool set, updates the UI, and triggers a
@@ -903,10 +1006,7 @@ function advancePhase(pi: ExtensionAPI, ctx: ExtensionContext, next: PlanFlowSta
 	persistPlanState(pi, next, reason);
 	applyActiveTools(pi, next); // takes effect on the next turn (the one we are about to start)
 	updatePlanUi(ctx, next);
-	pi.sendMessage(
-		{ customType: PLAN_KICK_CUSTOM_TYPE, content: kickContent, display: false },
-		{ triggerTurn: true },
-	);
+	kickTurn(pi, kickContent);
 }
 
 /** Compact one-line research kickoff (display:false, used by advancePhase at /plan start). */
