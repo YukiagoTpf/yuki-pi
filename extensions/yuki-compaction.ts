@@ -286,7 +286,11 @@ export default function yukiCompactionExtension(pi: ExtensionAPI) {
 		const branch = ctx.sessionManager.getBranch();
 		const config = reconstructConfig(branch);
 		if (!config.enabled) return;
-		const state = reconstructCompactionState(branch);
+		// Record zero-cost decision/constraint candidates every turn so nothing is lost
+		// between compactions, but do NOT trigger proactive compaction here. Triggering on
+		// turn_end interrupts an in-flight task mid-run (a long task is many turns); proactive
+		// compaction only fires at agent_end, the natural task boundary. Hard context-limit
+		// overflow is still covered by Pi's native auto-compact path.
 		const turnMessages = [event.message, ...(event.toolResults as unknown as AgentMessage[])];
 		const candidates = extractCandidatesFromTurn(event.turnIndex, turnMessages);
 		if (candidates.decisions.length > 0 || candidates.constraints.length > 0) {
@@ -300,8 +304,6 @@ export default function yukiCompactionExtension(pi: ExtensionAPI) {
 				constraints: candidates.constraints,
 			} satisfies YukiCompactionDeltaRecord);
 		}
-
-		maybeTriggerCompaction(ctx, state, config);
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
@@ -372,7 +374,10 @@ export default function yukiCompactionExtension(pi: ExtensionAPI) {
 
 	function maybeTriggerCompaction(ctx: ExtensionContext, state: YukiCompactionState, config: YukiCompactionConfig) {
 		if (!config.enabled || !config.proactive) return;
-		// Phase 0 showed ctx.compact() from turn_end/agent_end in print/json mode can enter
+		// Proactive compaction fires only from agent_end (the natural task boundary), never
+		// mid-task from turn_end, so an in-flight task is not interrupted and the prompt-cache
+		// prefix is reset far less often.
+		// Phase 0 showed ctx.compact() from agent_end in print/json mode can enter
 		// session_before_compact and then abort before append because the one-shot run is
 		// tearing down. Proactive compaction is for long-lived interactive/RPC sessions;
 		// native auto-compact/manual commands still cover other modes.
