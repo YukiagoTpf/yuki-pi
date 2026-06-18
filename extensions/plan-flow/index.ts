@@ -3,11 +3,11 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
-import { access, mkdir, unlink, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { createTodoState, makeTodoStateRecord } from "../todo/index.ts";
 import { PLAN_STATE_CUSTOM_TYPE, TODO_STATE_CUSTOM_TYPE } from "../shared/constants.ts";
-import { isExecutableResolution, slugify } from "../shared/plan-helpers.ts";
+import { isExecutableResolution, parsePlanCommandArgs, slugify } from "../shared/plan-helpers.ts";
 
 export { PLAN_STATE_CUSTOM_TYPE };
 
@@ -50,6 +50,19 @@ interface ReviewFeedback {
 	raw?: string;
 }
 
+interface PlanningContext {
+	/** Originating command, e.g. "/ta-dev". */
+	sourceCommand?: string;
+	/** Declared profiles, e.g. ["csharp", "shader"]. */
+	profiles?: string[];
+	/** Mandatory sensor/validation requirements the plan must cover, e.g.
+	 * ["unity-csharp-compile", "unity-shader-compile"]. plan_write enforces that the
+	 * union of all step `validation` entries covers every mandatory item. */
+	mandatoryValidation?: string[];
+	/** Declared/expected touched files. */
+	declaredFiles?: string[];
+}
+
 interface PlanFlowState {
 	version: 1;
 	active: boolean;
@@ -57,6 +70,7 @@ interface PlanFlowState {
 	planId: string;
 	request: string;
 	title?: string;
+	planningContext?: PlanningContext;
 	previousActiveTools: string[];
 	currentActiveTools: string[];
 	questions: OpenQuestion[];
@@ -159,14 +173,32 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 	let consecutiveBlockedToolCalls = 0;
 
 	pi.registerCommand("plan", {
-		description: "Start yuki plan-flow for a requested change",
+		description: "Start yuki plan-flow for a requested change: /plan [--context <token>] <request>",
 		handler: async (args, ctx) => {
-			const request = args.trim();
-			if (!request) {
-				ctx.ui.notify("Usage: /plan <request>", "warning");
+			const parsed = parsePlanCommandArgs(args);
+			if (!parsed.request) {
+				ctx.ui.notify("Usage: /plan [--context <token>] <request>", parsed.help ? "info" : "warning");
+				return;
+			}
+			if (parsed.unknownFlags.length > 0) {
+				ctx.ui.notify(`Unknown /plan option(s): ${parsed.unknownFlags.join(", ")}`, "warning");
 				return;
 			}
 
+			// rev.3 P0-2: load optional structured planning context (e.g. from /ta-dev)
+			// from a handoff file, so callers do not have to serialize constraints into
+			// the visible /plan prompt text. The file is consumed once and deleted.
+			let planningContext: PlanningContext | undefined;
+			if (parsed.contextToken) {
+				const loaded = await loadPlanningContext(ctx, parsed.contextToken);
+				if (loaded.error) {
+					ctx.ui.notify(loaded.error, "warning");
+					return;
+				}
+				planningContext = loaded.context;
+			}
+
+			const request = parsed.request;
 			const existing = reconstructPlanState(ctx);
 			if (existing?.active && existing.phase !== "aborted") {
 				ctx.ui.notify(`A yuki plan is already active (${existing.phase}). Use /plan-abort first.`, "warning");
@@ -181,6 +213,7 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 				phase: "research",
 				planId: createPlanId(),
 				request,
+				planningContext,
 				previousActiveTools,
 				currentActiveTools: [],
 				questions: [],
@@ -704,6 +737,23 @@ function applyPlanWrite(current: PlanFlowState, params: PlanWriteInput): PlanFlo
 		throw new Error("plan_write: every step must include non-empty content and activeForm.");
 	}
 
+	// rev.3 P0-2: when a planning context declared mandatory validation/sensors, the
+	// plan as a whole must cover every mandatory item across its steps' validation
+	// entries (case-insensitive substring match, so "unity-csharp-compile" matches a
+	// step validation phrase that contains it). Missing items are reported so the
+	// model can add them rather than silently dropping the constraint.
+	const mandatory = current.planningContext?.mandatoryValidation?.filter(Boolean) ?? [];
+	if (mandatory.length > 0) {
+		const union = steps.flatMap((step) => step.validation ?? []).join("\n").toLowerCase();
+		if (union.trim() === "") {
+			throw new Error(`plan_write: planning context requires validation covering [${mandatory.join(", ")}], but no step provides any validation.`);
+		}
+		const missing = mandatory.filter((item) => !union.includes(item.toLowerCase()));
+		if (missing.length > 0) {
+			throw new Error(`plan_write: mandatory validation not covered by any step: [${missing.join(", ")}]. Add the missing sensor(s) to the relevant steps' validation.`);
+		}
+	}
+
 	const nextPhase: Phase = current.phase === "drafting" ? "drafting" : "awaiting_approval";
 	return touch({
 		...current,
@@ -902,6 +952,16 @@ function renderPlanMarkdown(state: PlanFlowState): string {
 	if (resolvedQuestions.length === 0) lines.push("- None recorded.");
 	else resolvedQuestions.forEach((question) => lines.push(`- ${question.topic}: ${question.resolution}`));
 	lines.push("");
+	const pc = state.planningContext;
+	if (pc && (pc.sourceCommand || pc.profiles?.length || pc.mandatoryValidation?.length || pc.declaredFiles?.length)) {
+		lines.push("## Planning context");
+		lines.push("");
+		if (pc.sourceCommand) lines.push(`- Source: ${pc.sourceCommand}`);
+		if (pc.profiles?.length) lines.push(`- Profiles: ${pc.profiles.join(", ")}`);
+		if (pc.mandatoryValidation?.length) lines.push(`- Mandatory validation: ${pc.mandatoryValidation.join(", ")}`);
+		if (pc.declaredFiles?.length) lines.push(`- Declared files: ${pc.declaredFiles.join(", ")}`);
+		lines.push("");
+	}
 	lines.push("## Steps");
 	lines.push("");
 	state.steps.forEach((step, index) => {
@@ -1049,7 +1109,7 @@ function buildPhasePrompt(state: PlanFlowState): string {
 		return `[YUKI PLAN FLOW: grilling]\nAsk at most ${state.maxAskCount} critical decision questions total using plan_ask. Current count: ${state.askCount}. Ask only decisions you cannot inspect in the repo. Valid resolutions are concrete (not 随便/都行/看情况/之后再说/无所谓/不知道/whatever/TBD/idk or punctuation-only). Call grill_done when ready to draft.`;
 	}
 	if (state.phase === "drafting") {
-		return "[YUKI PLAN FLOW: drafting]\nCall plan_write with the structured plan, then wait for the automatic review.";
+		return `[YUKI PLAN FLOW: drafting]\nCall plan_write with the structured plan, then wait for the automatic review.${renderPlanningContextGuidance(state)}`;
 	}
 	if (state.phase === "revising") {
 		return "[YUKI PLAN FLOW: revising]\nCall plan_write with the revised plan addressing the review feedback.";
@@ -1074,7 +1134,18 @@ function formatPlanStatus(state: PlanFlowState): string {
 		`Draft: ${state.draftPath}`,
 		`Final: ${state.finalPath ?? "(none)"}`,
 		`Todo list: ${state.todoListId ?? "(none)"}`,
+		`Planning context: ${formatPlanningContextSummary(state)}`,
 	].join("\n");
+}
+
+function formatPlanningContextSummary(state: PlanFlowState): string {
+	const ctx = state.planningContext;
+	if (!ctx) return "(none)";
+	const parts: string[] = [];
+	if (ctx.sourceCommand) parts.push(`source=${ctx.sourceCommand}`);
+	if (ctx.profiles?.length) parts.push(`profiles=${ctx.profiles.join(",")}`);
+	if (ctx.mandatoryValidation?.length) parts.push(`mandatory=${ctx.mandatoryValidation.join(",")}`);
+	return parts.length > 0 ? parts.join(" ") : "(empty)";
 }
 
 function normalizePlanState(state: PlanFlowState): PlanFlowState {
@@ -1088,6 +1159,7 @@ function normalizePlanState(state: PlanFlowState): PlanFlowState {
 		risks: state.risks ?? [],
 		previousActiveTools: state.previousActiveTools ?? [],
 		currentActiveTools: state.currentActiveTools ?? [],
+		planningContext: state.planningContext ?? undefined,
 	};
 }
 
@@ -1095,6 +1167,53 @@ function touch(state: PlanFlowState): PlanFlowState {
 	const next = { ...state, updatedAt: new Date().toISOString() };
 	next.currentActiveTools = getAllowedToolsForState(next);
 	return next;
+}
+
+/** rev.3 P0-2: directory for one-shot planning-context handoff files written by
+ * callers like /ta-dev and consumed (and deleted) by /plan --context <token>. */
+const PLAN_CONTEXT_DIR = ".pi/plan-context";
+
+async function loadPlanningContext(ctx: ExtensionContext, token: string): Promise<{ context?: PlanningContext; error?: string }> {
+	if (!/^[A-Za-z0-9_-]+$/.test(token)) {
+		return { error: `Invalid --context token '${token}' (allowed: letters, digits, '-', '_').` };
+	}
+	const path = resolve(ctx.cwd, PLAN_CONTEXT_DIR, `${token}.json`);
+	let raw: string;
+	try {
+		raw = await readFile(path, "utf8");
+	} catch {
+		return { error: `Planning context '${token}' not found at ${PLAN_CONTEXT_DIR}/${token}.json.` };
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (error) {
+		return { error: `Planning context '${token}' is not valid JSON: ${(error as Error).message}` };
+	}
+	if (typeof parsed !== "object" || parsed === null) {
+		return { error: `Planning context '${token}' must be a JSON object.` };
+	}
+	const obj = parsed as Partial<PlanningContext>;
+	const context: PlanningContext = {
+		sourceCommand: typeof obj.sourceCommand === "string" ? obj.sourceCommand : undefined,
+		profiles: Array.isArray(obj.profiles) ? obj.profiles.filter((v): v is string => typeof v === "string") : undefined,
+		mandatoryValidation: Array.isArray(obj.mandatoryValidation) ? obj.mandatoryValidation.filter((v): v is string => typeof v === "string") : undefined,
+		declaredFiles: Array.isArray(obj.declaredFiles) ? obj.declaredFiles.filter((v): v is string => typeof v === "string") : undefined,
+	};
+	// Consume the handoff file once it has been read into state.
+	await unlink(path).catch(() => undefined);
+	return { context };
+}
+
+/** Render planning-context mandatory validation into the drafting phase prompt so the
+ * model knows which sensors each step's `validation` must cover (plan_write enforces it). */
+function renderPlanningContextGuidance(state: PlanFlowState): string {
+	const mandatory = state.planningContext?.mandatoryValidation?.filter(Boolean) ?? [];
+	if (mandatory.length === 0) return "";
+	const files = state.planningContext?.declaredFiles?.filter(Boolean) ?? [];
+	const lines = [``, `Mandatory validation (every step that touches a relevant file must include these in its validation): ${mandatory.join(", ")}.`];
+	if (files.length > 0) lines.push(`Declared/expected files: ${files.join(", ")}.`);
+	return lines.join("\n");
 }
 
 function createPlanId(): string {

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { isExecutableResolution, slugify } from "../extensions/shared/plan-helpers.ts";
+import { isExecutableResolution, parsePlanCommandArgs, slugify } from "../extensions/shared/plan-helpers.ts";
 
 describe("isExecutableResolution", () => {
 	it("accepts short but concrete answers", () => {
@@ -35,6 +35,46 @@ describe("isExecutableResolution", () => {
 	it("accepts purely numeric answers", () => {
 		assert.equal(isExecutableResolution("3"), true);
 		assert.equal(isExecutableResolution("v2"), true);
+	});
+});
+
+describe("parsePlanCommandArgs", () => {
+	it("treats a bare request as the whole request with no context", () => {
+		const p = parsePlanCommandArgs("fix the bug in parser");
+		assert.equal(p.request, "fix the bug in parser");
+		assert.equal(p.contextToken, undefined);
+		assert.deepEqual(p.unknownFlags, []);
+		assert.equal(p.help, false);
+	});
+
+	it("extracts --context <token> and leaves the rest as request", () => {
+		const p = parsePlanCommandArgs("--context abc123 修改 Foo 的运行逻辑");
+		assert.equal(p.contextToken, "abc123");
+		assert.equal(p.request, "修改 Foo 的运行逻辑");
+		assert.deepEqual(p.unknownFlags, []);
+	});
+
+	it("preserves quoted segments in the request", () => {
+		const p = parsePlanCommandArgs('--context t1 "add a step that says hello world"');
+		assert.equal(p.contextToken, "t1");
+		assert.equal(p.request, "add a step that says hello world");
+	});
+
+	it("flags --context with a missing token", () => {
+		const q = parsePlanCommandArgs("--context --foo x");
+		assert.ok(q.unknownFlags.some((f) => f.startsWith("--context (missing")));
+	});
+
+	it("collects unknown flags and still extracts the request", () => {
+		const p = parsePlanCommandArgs("--verbose --context tok do thing");
+		assert.equal(p.contextToken, "tok");
+		assert.equal(p.request, "do thing");
+		assert.ok(p.unknownFlags.includes("--verbose"));
+	});
+
+	it("recognizes --help/-h", () => {
+		assert.equal(parsePlanCommandArgs("--help").help, true);
+		assert.equal(parsePlanCommandArgs("-h something").help, true);
 	});
 });
 
