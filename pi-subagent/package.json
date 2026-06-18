@@ -1,0 +1,76 @@
+{
+  "name": "@mjakl/pi-subagent",
+  "version": "3.0.0",
+  "description": "Subagent extension for Pi coding agent. Delegate prompts to specialized agents with optional named sessions.",
+  "type": "module",
+  "main": "index.ts",
+  "files": [
+    "index.ts",
+    "agents.ts",
+    "contract.ts",
+    "runner.ts",
+    "runner-cli.js",
+    "runner-events.js",
+    "session-lock.ts",
+    "session-paths.ts",
+    "render.ts",
+    "types.ts",
+    "agents/*.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "pi",
+    "subagent",
+    "delegation",
+    "pi-package"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mjakl/pi-subagent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mjakl/pi-subagent/issues"
+  },
+  "homepage": "https://github.com/mjakl/pi-subagent#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "typescript": "^5.9.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-agent-core": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  }
+}
