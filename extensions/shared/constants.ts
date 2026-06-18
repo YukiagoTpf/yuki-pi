@@ -12,3 +12,6 @@ export const PLAN_STATE_CUSTOM_TYPE = "yuki-plan-flow-state";
 
 /** customType for persisted todo state snapshots. */
 export const TODO_STATE_CUSTOM_TYPE = "yuki-todo-state";
+
+/** customType for yuki compaction runtime deltas. */
+export const COMPACTION_STATE_CUSTOM_TYPE = "yuki-compaction-state";
