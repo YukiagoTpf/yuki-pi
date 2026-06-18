@@ -14,7 +14,8 @@
     "extensions": [
       "./extensions/*.ts",
       "./extensions/todo/index.ts",
-      "./extensions/plan-flow/index.ts"
+      "./extensions/plan-flow/index.ts",
+      "./pi-subagent/index.ts"
     ]
   },
   "peerDependencies": {
