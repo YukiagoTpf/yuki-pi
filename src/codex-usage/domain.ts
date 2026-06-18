@@ -32,10 +32,10 @@ export type UsageSnapshot = {
 export const DEFAULT_PREFERENCES = { usageMode: "left", refreshWindow: "7d" } satisfies Preferences;
 export const SPARK_MODEL_ID = "gpt-5.3-codex-spark";
 
-const CODEX_MODEL_PREFIX = "gpt-5.3-codex";
+const CODEX_PROVIDER = "openai-codex";
 
-export function isCodexModel(modelId: string | undefined): boolean {
-	return !!modelId && modelId.startsWith(CODEX_MODEL_PREFIX);
+export function isCodexProvider(provider: string | undefined): boolean {
+	return !!provider && provider === CODEX_PROVIDER;
 }
 
 export const windows = {
