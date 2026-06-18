@@ -149,6 +149,11 @@ const GrillDoneParams = Type.Object({
 export default function planFlowExtension(pi: ExtensionAPI) {
 	// Guards against running two automatic reviews concurrently within one process.
 	let reviewInFlight = false;
+	// Counts consecutive phase-discipline tool blocks so repeated wrong-tool calls escalate to a
+	// shorter, stronger steer. Re-emitting the identical message on every rejected call read like a
+	// deadloop in the incident; an allowed call resets it. In-memory only, like the compile guard's
+	// retry counters — a reload starts fresh, which is fine for a steering hint.
+	let consecutiveBlockedToolCalls = 0;
 
 	pi.registerCommand("plan", {
 		description: "Start yuki plan-flow for a requested change",
@@ -262,11 +267,13 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 		}
 		const allowed = getAllowedToolsForState(state);
 		if (!allowed.includes(event.toolName)) {
+			consecutiveBlockedToolCalls += 1;
 			return {
 				block: true,
-				reason: `yuki plan-flow: tool ${event.toolName} is not allowed during phase ${state.phase}. Allowed: ${allowed.join(", ")}. ${nextActionHint(state)}`,
+				reason: buildBlockedToolReason(state, event.toolName, allowed, consecutiveBlockedToolCalls),
 			};
 		}
+		consecutiveBlockedToolCalls = 0;
 	});
 
 	pi.on("turn_end", async (_event, ctx) => {
@@ -875,6 +882,14 @@ function buildKickoffMessage(state: PlanFlowState): string {
 		"Use plan_ask for unresolved critical questions, then grill_done, then plan_write.",
 		"After automatic review/revision, call plan_exit to request user approval before implementation.",
 	].join("\n");
+}
+
+function buildBlockedToolReason(state: PlanFlowState, toolName: string, allowed: string[], attempts: number): string {
+	const allowedList = allowed.join(", ");
+	if (attempts <= 1) {
+		return `yuki plan-flow: tool ${toolName} is not allowed during phase ${state.phase}. Allowed: ${allowedList}. ${nextActionHint(state)}`;
+	}
+	return `yuki plan-flow: STOP — ${toolName} is still blocked in phase ${state.phase} (rejected ${attempts}x in a row). The ONLY tool you may call now is: ${allowedList}. Call it exactly once and call nothing else; do not retry read/grep/ask/bash/edit.`;
 }
 
 function nextActionHint(state: PlanFlowState): string {
