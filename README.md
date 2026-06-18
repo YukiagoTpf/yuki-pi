@@ -21,6 +21,7 @@ pi -e git:github.com/YukiagoTpf/yuki-pi
 - `extensions/recap.ts` — `/recap` one-sentence session progress recap.
 - `extensions/yuki-compaction.ts` — structured long-session compaction with pruning, archives, pinned state, and proactive triggers.
 - `extensions/codex-usage-status.ts` — footer status for Codex/Codex Spark usage windows, adapted from `@calesennett/pi-codex-usage`.
+- `extensions/yuki-statusline.ts` — concise Claude Code-style footer: path, git branch, model, and context progress bar.
 - `extensions/enable-grep.ts` — enables Pi's built-in `grep` tool.
 - `extensions/todo/index.ts` — standalone branch-safe `todo_write` / `todo_clear` / `todo_read` tools and `/todos` command.
 - `extensions/plan-flow/index.ts` — `/plan` workflow: read-only research, grilling, automatic review, approval via `plan_exit`, final plan file, and plan-owned todo seeding.
