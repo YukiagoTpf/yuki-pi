@@ -93,6 +93,20 @@ interface YukiCompactionConfig {
 	preStoreArchiveChars: number;
 	runtimeToolTextChars: number;
 	summarizerModel?: string;
+	/** Reuse the live conversation prefix (system prompt + real history) for the summary call (oh-my-pi handoff style). */
+	cacheAwareSummary: boolean;
+	/** Gate proactive compaction behind a cache-aware net-benefit model (pi-better-compact DP style). */
+	economicGate: boolean;
+	/** Always compact above this usage ratio regardless of the economic model. */
+	forceRatio: number;
+	/** Uncached input price ($/MTok) used by the economic model. */
+	priceInputPerM: number;
+	/** Cached input price ($/MTok). */
+	priceCachePerM: number;
+	/** Output price ($/MTok). */
+	priceOutputPerM: number;
+	/** Expected remaining user turns; amortizes future savings of compacting now. */
+	expectedTurns: number;
 	updatedAt?: string;
 }
 
@@ -141,6 +155,13 @@ const DEFAULT_CONFIG: YukiCompactionConfig = {
 	minCompactIntervalMs: 60_000,
 	preStoreArchiveChars: 12_000,
 	runtimeToolTextChars: 4_000,
+	cacheAwareSummary: true,
+	economicGate: true,
+	forceRatio: 0.92,
+	priceInputPerM: 3.0,
+	priceCachePerM: 0.3,
+	priceOutputPerM: 15.0,
+	expectedTurns: 8,
 };
 
 const INTERNAL = {
@@ -158,16 +179,23 @@ const YUKI_COMPACT_HELP = [
 	"Usage: /yuki-compact [command]",
 	"",
 	"Commands:",
-	"  show | status                 Show current config and state",
+	"  show | status                 Show current config, state, and live dp-eval",
 	"  now                           Trigger compaction now",
 	"  on | off                      Enable/disable Yuki override for built-in /compact",
 	"  proactive on | off            Enable/disable proactive ctx.compact()",
+	"  cache-summary on | off        Reuse live conversation prefix for the summary call",
+	"  economic on | off             Gate proactive compaction behind the net-benefit model",
 	"  model auto | <provider/model>  Set summarizer model preference",
 	"  set trigger <0..1>             Set proactive trigger ratio (default 0.85)",
+	"  set force <0..1>               Always compact above this usage ratio (default 0.92)",
 	"  set target-free <0..1>         Set target free ratio after compact (default 0.40)",
 	"  set min-interval-ms <ms>       Set proactive min interval (default 60000)",
 	"  set archive-chars <chars>      Set pre-store archive threshold (default 12000)",
 	"  set runtime-chars <chars>      Set runtime prune threshold (default 4000)",
+	"  set expected-turns <n>         Remaining-turns estimate for economics (default 8)",
+	"  set price-input <$/MTok>       Uncached input price (default 3.0)",
+	"  set price-cache <$/MTok>       Cached input price (default 0.3)",
+	"  set price-output <$/MTok>      Output price (default 15.0)",
 	"  reset                         Restore defaults",
 ].join("\n");
 
@@ -233,6 +261,8 @@ export default function yukiCompactionExtension(pi: ExtensionAPI) {
 			else if (cmd === "reset") next = { ...DEFAULT_CONFIG };
 			else if (cmd === "proactive" && (key === "on" || key === "enable")) next = { ...config, proactive: true };
 			else if (cmd === "proactive" && (key === "off" || key === "disable")) next = { ...config, proactive: false };
+			else if (cmd === "cache-summary") next = setConfigValue(config, "cache-summary", key);
+			else if (cmd === "economic" || cmd === "dp") next = setConfigValue(config, "economic", key);
 			else if (cmd === "model") next = setConfigValue(config, "model", key);
 			else if (cmd === "set" && key) next = setConfigValue(config, key, rest.join(" "));
 			else next = setConfigValue(config, cmd, [key, ...rest].filter(Boolean).join(" "));
@@ -391,6 +421,21 @@ export default function yukiCompactionExtension(pi: ExtensionAPI) {
 		if (now - lastRequestedAt < config.minCompactIntervalMs) return;
 		if (state.lastCompactAt && now - Date.parse(state.lastCompactAt) < config.minCompactIntervalMs) return;
 
+		// Economic gate (pi-better-compact DP style): the hysteresis threshold above only says
+		// "the context is large enough to consider compacting". Whether compacting now actually
+		// pays off depends on the prompt-cache economics: compacting buys cheaper future requests
+		// but costs one cache-prefix reset plus the summary call. Below forceRatio we only compact
+		// when the modeled net benefit is positive; above forceRatio the context is close enough
+		// to the wall that we compact regardless.
+		const forceThreshold = usableWindow(usage.contextWindow, maxOutputTokens) * config.forceRatio;
+		if (config.economicGate && usage.tokens <= forceThreshold) {
+			const decision = evaluateCompactionEconomics(usage.tokens, usage.contextWindow, maxOutputTokens, config);
+			if (decision.netBenefit <= 0) {
+				ctx.ui.setStatus("yuki-compact", undefined);
+				return;
+			}
+		}
+
 		compactInFlight = true;
 		lastRequestedAt = now;
 		lastTrigger = "yuki";
@@ -408,6 +453,54 @@ export default function yukiCompactionExtension(pi: ExtensionAPI) {
 			},
 		});
 	}
+}
+
+/**
+ * Cache-aware net-benefit model for "should we compact now?" (pi-better-compact DP style).
+ *
+ * All terms are in dollars over the expected remaining turns. We compare keeping the current
+ * large context against compacting down to the post-compact target size.
+ *
+ * - futureSavings: each remaining turn re-sends the prefix. With prompt caching the prefix is
+ *   billed at the cache price, so the saving per turn is the freed token count × cache price.
+ * - cacheInvalidation: compacting rewrites the prefix, so the first request after compaction
+ *   re-pays full (uncached) input price on the kept context.
+ * - summaryCost: the summary LLM call. With cacheAwareSummary the input is mostly a cache hit,
+ *   so its input is priced at the cache rate; otherwise full input price.
+ */
+function evaluateCompactionEconomics(
+	currentTokens: number,
+	contextWindow: number,
+	maxOutputTokens: number,
+	config: YukiCompactionConfig,
+): { netBenefit: number; futureSavings: number; cacheInvalidation: number; summaryCost: number; freedTokens: number } {
+	const usable = usableWindow(contextWindow, maxOutputTokens);
+	const targetTokens = usable * (1 - config.targetFreeRatio);
+	const keptTokens = Math.max(0, Math.min(currentTokens, targetTokens));
+	const freedTokens = Math.max(0, currentTokens - keptTokens);
+	const turns = Math.max(1, config.expectedTurns);
+
+	const perM = (tokens: number, pricePerM: number) => (tokens / 1_000_000) * pricePerM;
+
+	// Without compaction the freed tokens ride along (cache-priced) every remaining turn.
+	// After compaction they are gone, so this is the recurring saving.
+	const futureSavings = perM(freedTokens, config.priceCachePerM) * turns;
+
+	// The summary itself becomes part of the new prefix; its tokens also recur, partially
+	// offsetting the saving. Treat the summary output as recurring cache-priced input.
+	const summaryTokens = INTERNAL.minSummaryTokens;
+	const recurringSummaryDrag = perM(summaryTokens, config.priceCachePerM) * turns;
+
+	// Compaction resets the cache: the kept context is re-billed once at the uncached rate.
+	const cacheInvalidation = perM(keptTokens, config.priceInputPerM - config.priceCachePerM);
+
+	// The summary generation call. Cache-aware summary reuses the live prefix (cache price);
+	// otherwise the whole conversation is uncached input.
+	const summaryInputPrice = config.cacheAwareSummary ? config.priceCachePerM : config.priceInputPerM;
+	const summaryCost = perM(currentTokens, summaryInputPrice) + perM(summaryTokens, config.priceOutputPerM);
+
+	const netBenefit = futureSavings - recurringSummaryDrag - cacheInvalidation - summaryCost;
+	return { netBenefit, futureSavings, cacheInvalidation, summaryCost: summaryCost + recurringSummaryDrag, freedTokens };
 }
 
 async function pruneToolResult(
@@ -518,12 +611,46 @@ async function generateVolatileSummary(event: CompactionEvent, ctx: ExtensionCon
 	}
 	if (!selected || !selectedAuth?.apiKey) return fallbackVolatileSummary(event, authErrors.join("; ") || "No usable summarization auth.");
 
-	const allMessages = [...event.preparation.messagesToSummarize, ...event.preparation.turnPrefixMessages];
-	const conversationText = serializeConversation(convertToLlm(allMessages));
 	const previous = event.preparation.previousSummary ? `\n\nPrevious summary:\n${event.preparation.previousSummary}` : "";
 	const custom = event.customInstructions ? `\n\nCustom instructions:\n${event.customInstructions}` : "";
 	const maxTokens = Math.max(INTERNAL.minSummaryTokens, Math.min(INTERNAL.maxSummaryTokens, budget.summary));
 
+	// The summary instruction is identical in both paths so it can live at the very END
+	// of the request, after the cached prefix, without changing earlier tokens.
+	const instruction = `Create ONLY the volatile parts of a Yuki-Pi compaction summary.\n\nState-driven sections below are authoritative and must not be rewritten; use them only for context.\n\n${stateSections}${previous}${custom}\n\nSummarize the conversation above (the portion that will be discarded) into these markdown sections only:\n\n## Critical Context\n- facts needed to continue, including files, APIs, commands, errors, and constraints not already in state sections\n\n## Work Progress\n### Done\n- completed work\n### In Progress\n- active partial work\n### Blocked\n- blockers or none\n\n## Next Steps\n1. concrete next action\n\nKeep it concise and recovery-oriented. Do not invent facts.`;
+
+	// Cache-aware (handoff) path: reuse the live conversation prefix so the summarizer
+	// request shares the prompt-cache prefix with the main conversation. We send the
+	// active system prompt + the real (converted) message history, then append a single
+	// instruction message at the end. Only the tiny trailing message is uncached; the
+	// large history prefix is a cache hit. This only pays off when the summarizer is the
+	// same model as the conversation (no Gemini key), since cache is per-model/provider.
+	const sameModelAsConversation = Boolean(ctx.model && selected.provider === ctx.model.provider && selected.id === ctx.model.id);
+	if (config.cacheAwareSummary && sameModelAsConversation) {
+		try {
+			const historyMessages = convertToLlm([...event.preparation.messagesToSummarize, ...event.preparation.turnPrefixMessages]);
+			const response = await complete(
+				selected,
+				{
+					systemPrompt: ctx.getSystemPrompt(),
+					messages: [
+						...historyMessages,
+						{ role: "user" as const, content: [{ type: "text" as const, text: instruction }], timestamp: Date.now() },
+					],
+				},
+				{ apiKey: selectedAuth.apiKey, headers: selectedAuth.headers, maxTokens, cacheRetention: "short", signal: event.signal },
+			);
+			const text = extractText(response);
+			if (text) return text;
+			// Empty result: fall through to the self-contained path below.
+		} catch (error) {
+			if (isAbortError(error) || isAborted(event.signal)) throw error;
+			// Provider rejected the reused prefix (e.g. tool-call/result pairing); fall back.
+		}
+	}
+
+	// Self-contained path: embed the serialized conversation inside one user message.
+	const conversationText = serializeConversation(convertToLlm([...event.preparation.messagesToSummarize, ...event.preparation.turnPrefixMessages]));
 	const response = await complete(
 		selected,
 		{
@@ -533,7 +660,7 @@ async function generateVolatileSummary(event: CompactionEvent, ctx: ExtensionCon
 					content: [
 						{
 							type: "text" as const,
-							text: `Create ONLY the volatile parts of a Yuki-Pi compaction summary.\n\nState-driven sections below are authoritative and must not be rewritten; use them only for context.\n\n${stateSections}${previous}${custom}\n\nSummarize the conversation that will be discarded into these markdown sections only:\n\n## Critical Context\n- facts needed to continue, including files, APIs, commands, errors, and constraints not already in state sections\n\n## Work Progress\n### Done\n- completed work\n### In Progress\n- active partial work\n### Blocked\n- blockers or none\n\n## Next Steps\n1. concrete next action\n\nKeep it concise and recovery-oriented. Do not invent facts.\n\n<conversation>\n${conversationText}\n</conversation>`,
+							text: `${instruction}\n\n<conversation>\n${conversationText}\n</conversation>`,
 						},
 					],
 					timestamp: Date.now(),
@@ -543,12 +670,15 @@ async function generateVolatileSummary(event: CompactionEvent, ctx: ExtensionCon
 		{ apiKey: selectedAuth.apiKey, headers: selectedAuth.headers, maxTokens, signal: event.signal },
 	);
 
-	const text = response.content
+	return extractText(response) || fallbackVolatileSummary(event, "LLM returned empty summary.");
+}
+
+function extractText(response: { content: Array<{ type: string }> }): string {
+	return response.content
 		.filter((part): part is { type: "text"; text: string } => part.type === "text")
 		.map((part) => part.text)
 		.join("\n")
 		.trim();
-	return text || fallbackVolatileSummary(event, "LLM returned empty summary.");
 }
 
 function fallbackVolatileSummary(event: CompactionEvent, reason: string): string {
@@ -633,6 +763,13 @@ function normalizeConfig(config: Partial<YukiCompactionConfig>): YukiCompactionC
 		preStoreArchiveChars: Math.floor(clampNumber(config.preStoreArchiveChars, 1_000, 1_000_000, DEFAULT_CONFIG.preStoreArchiveChars)),
 		runtimeToolTextChars: Math.floor(clampNumber(config.runtimeToolTextChars, 1_000, 1_000_000, DEFAULT_CONFIG.runtimeToolTextChars)),
 		summarizerModel: config.summarizerModel || undefined,
+		cacheAwareSummary: config.cacheAwareSummary !== false,
+		economicGate: config.economicGate !== false,
+		forceRatio: clampNumber(config.forceRatio, 0.5, 0.99, DEFAULT_CONFIG.forceRatio),
+		priceInputPerM: clampNumber(config.priceInputPerM, 0, 1_000, DEFAULT_CONFIG.priceInputPerM),
+		priceCachePerM: clampNumber(config.priceCachePerM, 0, 1_000, DEFAULT_CONFIG.priceCachePerM),
+		priceOutputPerM: clampNumber(config.priceOutputPerM, 0, 1_000, DEFAULT_CONFIG.priceOutputPerM),
+		expectedTurns: Math.floor(clampNumber(config.expectedTurns, 1, 1_000, DEFAULT_CONFIG.expectedTurns)),
 		updatedAt: config.updatedAt,
 	};
 }
@@ -869,9 +1006,13 @@ async function openYukiCompactSettings(
 	const choice = await ctx.ui.select("Yuki Compaction Settings", [
 		`Builtin /compact override: ${config.enabled ? "Yuki ON" : "Yuki OFF"}`,
 		`Proactive: ${config.proactive ? "Enabled" : "Disabled"}`,
+		`Cache-aware summary: ${config.cacheAwareSummary ? "Enabled" : "Disabled"}`,
+		`Economic gate: ${config.economicGate ? "Enabled" : "Disabled"}`,
 		`Summarizer model: ${config.summarizerModel ?? "Auto"}`,
 		`Trigger ratio: ${config.triggerRatio}`,
+		`Force ratio: ${config.forceRatio}`,
 		`Target free ratio: ${config.targetFreeRatio}`,
+		`Expected turns: ${config.expectedTurns}`,
 		`Archive threshold: ${config.preStoreArchiveChars} chars`,
 		`Runtime prune threshold: ${config.runtimeToolTextChars} chars`,
 		`Minimum interval: ${config.minCompactIntervalMs} ms`,
@@ -884,9 +1025,13 @@ async function openYukiCompactSettings(
 	let next: YukiCompactionConfig | undefined;
 	if (choice.startsWith("Builtin /compact override:")) next = { ...config, enabled: !config.enabled };
 	else if (choice.startsWith("Proactive:")) next = { ...config, proactive: !config.proactive };
+	else if (choice.startsWith("Cache-aware summary:")) next = { ...config, cacheAwareSummary: !config.cacheAwareSummary };
+	else if (choice.startsWith("Economic gate:")) next = { ...config, economicGate: !config.economicGate };
 	else if (choice.startsWith("Summarizer model:")) next = await promptSummarizerModel(ctx, config, currentModel);
 	else if (choice.startsWith("Trigger ratio:")) next = await promptNumericSetting(ctx, config, "trigger", String(config.triggerRatio));
+	else if (choice.startsWith("Force ratio:")) next = await promptNumericSetting(ctx, config, "force", String(config.forceRatio));
 	else if (choice.startsWith("Target free ratio:")) next = await promptNumericSetting(ctx, config, "target-free", String(config.targetFreeRatio));
+	else if (choice.startsWith("Expected turns:")) next = await promptNumericSetting(ctx, config, "expected-turns", String(config.expectedTurns));
 	else if (choice.startsWith("Archive threshold:")) next = await promptNumericSetting(ctx, config, "archive-chars", String(config.preStoreArchiveChars));
 	else if (choice.startsWith("Runtime prune threshold:")) next = await promptNumericSetting(ctx, config, "runtime-chars", String(config.runtimeToolTextChars));
 	else if (choice.startsWith("Minimum interval:")) next = await promptNumericSetting(ctx, config, "min-interval-ms", String(config.minCompactIntervalMs));
@@ -965,6 +1110,34 @@ function setConfigValue(config: YukiCompactionConfig, key: string, value: string
 		case "runtime-chars":
 			if (!Number.isFinite(numeric)) return undefined;
 			return { ...config, runtimeToolTextChars: Math.floor(clampNumber(numeric, 1_000, 1_000_000, config.runtimeToolTextChars)) };
+		case "cache-summary":
+		case "cache-aware-summary":
+			if (value === "on" || value === "true") return { ...config, cacheAwareSummary: true };
+			if (value === "off" || value === "false") return { ...config, cacheAwareSummary: false };
+			return undefined;
+		case "economic":
+		case "economic-gate":
+		case "dp":
+			if (value === "on" || value === "true") return { ...config, economicGate: true };
+			if (value === "off" || value === "false") return { ...config, economicGate: false };
+			return undefined;
+		case "force":
+		case "force-ratio":
+			if (!Number.isFinite(numeric)) return undefined;
+			return { ...config, forceRatio: clampNumber(numeric, 0.5, 0.99, config.forceRatio) };
+		case "turns":
+		case "expected-turns":
+			if (!Number.isFinite(numeric)) return undefined;
+			return { ...config, expectedTurns: Math.floor(clampNumber(numeric, 1, 1_000, config.expectedTurns)) };
+		case "price-input":
+			if (!Number.isFinite(numeric)) return undefined;
+			return { ...config, priceInputPerM: clampNumber(numeric, 0, 1_000, config.priceInputPerM) };
+		case "price-cache":
+			if (!Number.isFinite(numeric)) return undefined;
+			return { ...config, priceCachePerM: clampNumber(numeric, 0, 1_000, config.priceCachePerM) };
+		case "price-output":
+			if (!Number.isFinite(numeric)) return undefined;
+			return { ...config, priceOutputPerM: clampNumber(numeric, 0, 1_000, config.priceOutputPerM) };
 		case "model":
 		case "summarizer-model":
 			if (!value || value === "auto") return { ...config, summarizerModel: undefined };
@@ -977,14 +1150,24 @@ function setConfigValue(config: YukiCompactionConfig, key: string, value: string
 
 function formatConfigStatus(ctx: ExtensionContext, state: YukiCompactionState, config: YukiCompactionConfig) {
 	const usage = ctx.getContextUsage();
-	return [
+	const lines = [
 		`Yuki compaction: ${config.enabled ? "on (/compact overridden)" : "off (/compact uses Pi default)"}, proactive=${config.proactive ? "on" : "off"}`,
 		`model=${config.summarizerModel ?? "auto (gemini-2.5-flash, then current model)"}`,
 		`trigger=${config.triggerRatio}, targetFree=${config.targetFreeRatio}, minIntervalMs=${config.minCompactIntervalMs}`,
 		`archiveChars=${config.preStoreArchiveChars}, runtimeChars=${config.runtimeToolTextChars}`,
+		`cacheAwareSummary=${config.cacheAwareSummary ? "on" : "off"}, economicGate=${config.economicGate ? "on" : "off"}, forceRatio=${config.forceRatio}`,
+		`economics: prices(in/cache/out)=${config.priceInputPerM}/${config.priceCachePerM}/${config.priceOutputPerM} $/MTok, expectedTurns=${config.expectedTurns}`,
 		`state: gen=${state.generation}, epoch=${state.epoch}, decisions=${state.decisions.length}, constraints=${state.constraints.length}`,
 		`usage=${usage?.tokens ?? "?"}/${usage?.contextWindow ?? "?"}`,
-	].join("\n");
+	];
+	if (config.economicGate && usage?.tokens && usage.contextWindow) {
+		const maxOutputTokens = ctx.model?.maxTokens ?? 16_384;
+		const e = evaluateCompactionEconomics(usage.tokens, usage.contextWindow, maxOutputTokens, config);
+		lines.push(
+			`dp-eval: freed≈${Math.round(e.freedTokens)} tok, futureSavings=$${e.futureSavings.toFixed(4)}, cacheReset=$${e.cacheInvalidation.toFixed(4)}, summaryCost=$${e.summaryCost.toFixed(4)} → net=$${e.netBenefit.toFixed(4)} (${e.netBenefit > 0 ? "compact" : "wait"})`,
+		);
+	}
+	return lines.join("\n");
 }
 
 function findConfiguredModel(ctx: ExtensionContext, setting: string | undefined) {
@@ -1022,4 +1205,19 @@ function safeFilePart(text: string) {
 
 function delay(ms: number) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isAbortError(error: unknown): boolean {
+	if (error instanceof Error) {
+		return (
+			error.name === "AbortError" ||
+			error.message === "aborted" ||
+			error.message.toLowerCase().includes("abort")
+		);
+	}
+	return String(error).toLowerCase().includes("abort");
+}
+
+function isAborted(signal: AbortSignal | undefined): boolean {
+	return signal?.aborted ?? false;
 }
