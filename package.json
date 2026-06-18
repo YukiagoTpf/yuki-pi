@@ -15,9 +15,19 @@
       "./extensions/*.ts",
       "./extensions/todo/index.ts",
       "./extensions/plan-flow/index.ts",
-      "./pi-subagent/index.ts"
+      "./pi-subagent/index.ts",
+      "./node_modules/pi-web-access/index.ts"
+    ],
+    "skills": [
+      "./node_modules/pi-web-access/skills"
     ]
   },
+  "dependencies": {
+    "pi-web-access": "^0.10.7"
+  },
+  "bundledDependencies": [
+    "pi-web-access"
+  ],
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-agent-core": "*",
