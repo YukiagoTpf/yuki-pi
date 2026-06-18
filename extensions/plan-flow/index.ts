@@ -264,7 +264,7 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 		if (!allowed.includes(event.toolName)) {
 			return {
 				block: true,
-				reason: `yuki plan-flow: tool ${event.toolName} is not allowed during phase ${state.phase}. Allowed: ${allowed.join(", ")}`,
+				reason: `yuki plan-flow: tool ${event.toolName} is not allowed during phase ${state.phase}. Allowed: ${allowed.join(", ")}. ${nextActionHint(state)}`,
 			};
 		}
 	});
@@ -634,13 +634,13 @@ function parseReviewFeedback(raw: string): ReviewFeedback {
 
 function buildReviewSteeringMessage(state: PlanFlowState): string {
 	if (state.reviewSkipped) {
-		return `Automatic review was skipped: ${state.reviewSkippedReason}. Call plan_exit for user approval and clearly mention the plan was not automatically reviewed.`;
+		return `Automatic review was skipped: ${state.reviewSkippedReason}. Next action: call plan_exit for user approval and clearly mention the plan was not automatically reviewed. Do not call plan_write again unless the user explicitly requests a revision.`;
 	}
 	if (state.phase === "revising") {
 		const issues = state.reviewFeedback?.blockingIssues.map((issue, index) => `${index + 1}. ${issue.stepId ? `[${issue.stepId}] ` : ""}${issue.issue}${issue.suggestion ? ` Suggestion: ${issue.suggestion}` : ""}`).join("\n") ?? "Review requested changes.";
 		return `Automatic review found blocking issues. Revise the plan with plan_write; do not execute yet.\n${issues}`;
 	}
-	return `Automatic review passed: ${state.reviewFeedback?.summary ?? "no blocking issues"}. Call plan_exit to request user approval; do not execute yet.`;
+	return `Automatic review passed: ${state.reviewFeedback?.summary ?? "no blocking issues"}. Next action: call plan_exit to request user approval. Do not call plan_write again unless the user explicitly requests a revision; do not execute yet.`;
 }
 
 function reconstructPlanState(ctx: ExtensionContext): PlanFlowState | undefined {
@@ -852,6 +852,11 @@ function updatePlanUi(ctx: ExtensionContext, state: PlanFlowState) {
 		ctx.ui.setWidget("yuki-plan", undefined);
 		return;
 	}
+	if (state.phase === "executing") {
+		ctx.ui.setStatus("yuki-plan", undefined);
+		ctx.ui.setWidget("yuki-plan", undefined);
+		return;
+	}
 	ctx.ui.setStatus("yuki-plan", `plan ${state.phase}`);
 	if (state.steps.length > 0) {
 		ctx.ui.setWidget("yuki-plan", state.steps.map((step, index) => `${index + 1}. ${step.content}`));
@@ -872,6 +877,17 @@ function buildKickoffMessage(state: PlanFlowState): string {
 	].join("\n");
 }
 
+function nextActionHint(state: PlanFlowState): string {
+	if (state.phase === "research") return "Next action: inspect files read-only, then call grill_plan.";
+	if (state.phase === "grilling") return "Next action: use plan_ask only for unresolved critical questions, otherwise call grill_done.";
+	if (state.phase === "drafting") return "Next action: call plan_write exactly once and wait for automatic review steering.";
+	if (state.phase === "reviewing") return "Next action: wait; automatic review is running.";
+	if (state.phase === "revising") return "Next action: call plan_write with the required revisions.";
+	if (state.phase === "awaiting_approval") return "Next action: call plan_exit; do not call plan_write again unless the user explicitly requests a revision.";
+	if (state.phase === "executing") return `Next action: use todo_read/todo_write on ${state.todoListId ?? "the plan-owned todo list"}.`;
+	return "Next action: follow the yuki plan-flow phase prompt.";
+}
+
 function buildPhasePrompt(state: PlanFlowState): string {
 	if (state.phase === "research") {
 		return `[YUKI PLAN FLOW: research]\nYou are in read-only planning mode for request: ${state.request}\nInspect files only. Do not edit or run mutating commands. When ready, call grill_plan with only critical decision questions. Do not call plan_write yet.`;
@@ -880,13 +896,13 @@ function buildPhasePrompt(state: PlanFlowState): string {
 		return `[YUKI PLAN FLOW: grilling]\nAsk at most ${state.maxAskCount} critical decision questions total using plan_ask. Current count: ${state.askCount}. Do not ask facts you can inspect. Invalid resolutions are vague non-answers (e.g. 随便, 都行, 看情况, 之后再说, 无所谓, 不知道, whatever, TBD, idk) or punctuation-only replies. Call grill_done when ready to draft.`;
 	}
 	if (state.phase === "drafting") {
-		return "[YUKI PLAN FLOW: drafting]\nCall plan_write with structured steps. The extension will run automatic review after plan_write; do not call plan_exit until review steering arrives.";
+		return "[YUKI PLAN FLOW: drafting]\nAllowed plan-flow tool: plan_write only. Call plan_write with structured steps exactly once, then stop and wait for automatic review steering. Do not call plan_ask, grill_plan, grill_done, or plan_exit in this phase.";
 	}
 	if (state.phase === "revising") {
-		return "[YUKI PLAN FLOW: revising]\nRevise the plan according to review/user feedback by calling plan_write. Do not execute.";
+		return "[YUKI PLAN FLOW: revising]\nAllowed plan-flow tool: plan_write only. Revise the plan according to review/user feedback by calling plan_write. Do not execute.";
 	}
 	if (state.phase === "awaiting_approval") {
-		return "[YUKI PLAN FLOW: awaiting approval]\nCall plan_exit to show the structured plan to the user. Do not implement before approval.";
+		return "[YUKI PLAN FLOW: awaiting approval]\nAllowed plan-flow tools: plan_exit, or plan_write only if the user explicitly requested a plan revision. Default next action is plan_exit. Do not implement before approval.";
 	}
 	if (state.phase === "executing") {
 		return `[YUKI PLAN FLOW: executing]\nThe plan is approved. Use todo_read/todo_write to track progress for list ${state.todoListId}. Keep at most one in_progress and provide evidence for completed items.`;

@@ -36,7 +36,7 @@ export interface TodoState {
 
 export interface TodoStateRecord {
 	kind: "snapshot";
-	reason: "seed" | "command" | "import" | "session_restore";
+	reason: "seed" | "command" | "import" | "session_restore" | "auto_clear_completed";
 	todoState: TodoState;
 }
 
@@ -82,6 +82,7 @@ export default function todoExtension(pi: ExtensionAPI) {
 
 	const refresh = (ctx: ExtensionContext) => {
 		states = reconstructTodoStates(ctx);
+		autoClearCompletedStandaloneStates(pi, states);
 		updateTodoWidget(ctx, states, getActivePlanRef(ctx));
 	};
 
@@ -100,6 +101,7 @@ export default function todoExtension(pi: ExtensionAPI) {
 		parameters: TodoReadParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			states = reconstructTodoStates(ctx);
+			autoClearCompletedStandaloneStates(pi, states);
 			const activePlan = getActivePlanRef(ctx);
 			const state = selectTodoState(states, params, activePlan) ?? createStandaloneState(params.listId);
 			updateTodoWidget(ctx, states, activePlan);
@@ -236,6 +238,7 @@ export default function todoExtension(pi: ExtensionAPI) {
 		description: "Show or clear yuki-pi todos on the current branch",
 		handler: async (args, ctx) => {
 			states = reconstructTodoStates(ctx);
+			autoClearCompletedStandaloneStates(pi, states);
 			const activePlan = getActivePlanRef(ctx);
 			const parsed = parseTodosCommandArgs(args);
 
@@ -517,20 +520,34 @@ function formatTodoStateForHuman(state: TodoState): string {
 	].join("\n");
 }
 
+function autoClearCompletedStandaloneStates(pi: ExtensionAPI, states: Map<string, TodoState>) {
+	for (const [listId, state] of states) {
+		if (state.source !== "standalone" || state.todos.length === 0) continue;
+		if (state.todos.some((todo) => todo.status !== "completed")) continue;
+		const next = normalizeTodoState({ ...state, todos: [], updatedAt: new Date().toISOString() });
+		states.set(listId, next);
+		pi.appendEntry(TODO_STATE_CUSTOM_TYPE, makeTodoStateRecord(next, "auto_clear_completed"));
+	}
+}
+
 function updateTodoWidget(ctx: ExtensionContext, states: Map<string, TodoState>, activePlan: ActivePlanRef | undefined) {
 	if (!ctx.hasUI) return;
 	const state = selectTodoState(states, {}, activePlan);
-	if (!state || state.todos.length === 0) {
+	if (!state || state.todos.length === 0 || state.todos.every((todo) => todo.status === "completed")) {
 		ctx.ui.setWidget("yuki-todos", undefined);
 		ctx.ui.setStatus("yuki-todos", undefined);
 		return;
 	}
 
 	ctx.ui.setStatus("yuki-todos", undefined);
-	ctx.ui.setWidget(
-		"yuki-todos",
-		state.todos.slice(0, 8).map((todo) => `${statusGlyph(todo.status)} ${todo.content}`),
-	);
+	const visibleTodos = state.todos.slice(0, 8);
+	ctx.ui.setWidget("yuki-todos", (_tui, theme) => {
+		const lines = visibleTodos.map((todo) => renderTodoWidgetLine(todo, theme));
+		return {
+			render: () => lines,
+			invalidate: () => {},
+		};
+	});
 }
 
 function statusBox(status: TodoStatus): string {
@@ -556,10 +573,13 @@ function statusGlyph(status: TodoStatus): string {
 }
 
 function renderTodoLine(todo: TodoItem, theme: { fg(name: string, text: string): string; strikethrough(text: string): string }) {
-	const glyph = statusGlyph(todo.status);
-	if (todo.status === "completed") return theme.fg("success", glyph) + " " + theme.fg("dim", theme.strikethrough(todo.content));
-	if (todo.status === "in_progress") return theme.fg("accent", glyph) + " " + theme.fg("accent", todo.content);
-	return theme.fg("dim", glyph) + " " + theme.fg("muted", todo.content);
+	return renderTodoWidgetLine(todo, theme);
+}
+
+function renderTodoWidgetLine(todo: TodoItem, theme: { fg(name: string, text: string): string; strikethrough(text: string): string }) {
+	if (todo.status === "completed") return theme.fg("success", "✔ ") + theme.fg("dim", theme.strikethrough(todo.content));
+	if (todo.status === "in_progress") return theme.fg("accent", "▪ ") + theme.fg("accent", todo.content);
+	return theme.fg("dim", "□ ") + theme.fg("muted", todo.content);
 }
 
 function textContent(result: { content?: Array<{ type?: string; text?: string }> }) {
