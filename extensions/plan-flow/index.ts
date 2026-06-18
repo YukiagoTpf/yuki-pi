@@ -7,13 +7,11 @@ import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { createTodoState, makeTodoStateRecord, reconstructTodoStates } from "../todo/index.ts";
 import { PLAN_STATE_CUSTOM_TYPE, TODO_STATE_CUSTOM_TYPE } from "../shared/constants.ts";
-import { isExecutableResolution, parsePlanCommandArgs, slugify } from "../shared/plan-helpers.ts";
+import { checkMandatoryValidation, getAllowedToolsForState as getAllowedToolsForPhase, isExecutableResolution, parsePlanCommandArgs, slugify } from "../shared/plan-helpers.ts";
 
 export { PLAN_STATE_CUSTOM_TYPE };
 
 const PLAN_TOOLS = new Set(["plan_ask", "grill_plan", "grill_done", "plan_write", "plan_exit"]);
-const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
-const TODO_TOOLS = ["todo_read", "todo_write"];
 /** customType for the one-line, display:false kick messages that drive A-class
  * (turn_end) phase transitions. See advancePhase(). */
 const PLAN_KICK_CUSTOM_TYPE = "yuki-plan-flow-kick";
@@ -783,13 +781,11 @@ function applyPlanWrite(current: PlanFlowState, params: PlanWriteInput): PlanFlo
 	// model can add them rather than silently dropping the constraint.
 	const mandatory = current.planningContext?.mandatoryValidation?.filter(Boolean) ?? [];
 	if (mandatory.length > 0) {
-		const union = steps.flatMap((step) => step.validation ?? []).join("\n").toLowerCase();
-		if (union.trim() === "") {
-			throw new Error(`plan_write: planning context requires validation covering [${mandatory.join(", ")}], but no step provides any validation.`);
-		}
-		const missing = mandatory.filter((item) => !union.includes(item.toLowerCase()));
-		if (missing.length > 0) {
-			throw new Error(`plan_write: mandatory validation not covered by any step: [${missing.join(", ")}]. Add the missing sensor(s) to the relevant steps' validation.`);
+		const check = checkMandatoryValidation(steps.map((step) => step.validation ?? []), mandatory);
+		if (!check.ok) {
+			throw new Error(
+				`plan_write: mandatory validation not covered by any step: [${check.missing.join(", ")}]. Add the missing sensor(s) to the relevant steps' validation.`,
+			);
 		}
 	}
 
@@ -1053,29 +1049,7 @@ function renderPlanMarkdown(state: PlanFlowState): string {
 }
 
 function getAllowedToolsForState(state: PlanFlowState): string[] {
-	const base = new Set<string>();
-	if (state.phase === "research") {
-		for (const tool of state.previousActiveTools) if (READ_ONLY_TOOLS.has(tool)) base.add(tool);
-		base.add("grill_plan");
-	} else if (state.phase === "grilling") {
-		for (const tool of state.previousActiveTools) if (READ_ONLY_TOOLS.has(tool)) base.add(tool);
-		base.add("plan_ask");
-		base.add("grill_plan");
-		base.add("grill_done");
-	} else if (state.phase === "drafting" || state.phase === "revising") {
-		base.add("plan_write");
-	} else if (state.phase === "awaiting_approval") {
-		base.add("plan_write");
-		base.add("plan_exit");
-	} else if (state.phase === "reviewing") {
-		// Automatic review is extension-driven; no model tools should be called.
-	} else if (state.phase === "executing") {
-		for (const tool of state.previousActiveTools) base.add(tool);
-		TODO_TOOLS.forEach((tool) => base.add(tool));
-	} else {
-		for (const tool of state.previousActiveTools) base.add(tool);
-	}
-	return [...base];
+	return getAllowedToolsForPhase(state.phase, state.previousActiveTools);
 }
 
 function applyActiveTools(pi: ExtensionAPI, state: PlanFlowState) {

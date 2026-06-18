@@ -106,3 +106,59 @@ export function tokenizePlanArgs(input: string): string[] {
 	if (current) tokens.push(current);
 	return tokens;
 }
+
+/** Read-only tools permitted during research/grilling. */
+export const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
+
+/** Todo tools always permitted during executing. */
+export const TODO_TOOLS = ["todo_read", "todo_write"];
+
+/**
+ * Compute the allowed tool set for a plan-flow phase.
+ *
+ * Pure (no Pi runtime) so the A/B-class narrowing contract can be unit tested.
+ * The result is the model's tool set for the NEXT turn when `setActiveTools` is
+ * applied at a turn boundary (A-class). For B-class (tool-execute) transitions
+ * the model is still mid-turn with the previous tool set, so this is the contract
+ * the `tool_call` block defends mid-turn and that takes effect on the next turn.
+ */
+export function getAllowedToolsForState(phase: string, previousActiveTools: string[] = []): string[] {
+	const base = new Set<string>();
+	if (phase === "research") {
+		for (const tool of previousActiveTools) if (READ_ONLY_TOOLS.has(tool)) base.add(tool);
+		base.add("grill_plan");
+	} else if (phase === "grilling") {
+		for (const tool of previousActiveTools) if (READ_ONLY_TOOLS.has(tool)) base.add(tool);
+		base.add("plan_ask");
+		base.add("grill_plan");
+		base.add("grill_done");
+	} else if (phase === "drafting" || phase === "revising") {
+		base.add("plan_write");
+	} else if (phase === "awaiting_approval") {
+		base.add("plan_write");
+		base.add("plan_exit");
+	} else if (phase === "reviewing") {
+		// Automatic review is extension-driven; no model tools should be called.
+	} else if (phase === "executing") {
+		for (const tool of previousActiveTools) base.add(tool);
+		for (const tool of TODO_TOOLS) base.add(tool);
+	} else {
+		// idle / completed / aborted / unknown → restore the user's tool set.
+		for (const tool of previousActiveTools) base.add(tool);
+	}
+	return [...base];
+}
+
+/**
+ * Check that a plan's steps cover every mandatory validation/sensor declared by a
+ * planning context. Returns the missing items (case-insensitive substring match, so
+ * "unity-csharp-compile" matches a step validation phrase containing it). Pure so the
+ * P0-2 enforcement can be unit tested.
+ */
+export function checkMandatoryValidation(stepValidations: string[][], mandatory: string[]): { ok: boolean; missing: string[] } {
+	if (mandatory.length === 0) return { ok: true, missing: [] };
+	const union = stepValidations.flat().join("\n").toLowerCase();
+	if (union.trim() === "") return { ok: false, missing: [...mandatory] };
+	const missing = mandatory.filter((item) => !union.includes(item.toLowerCase()));
+	return { ok: missing.length === 0, missing };
+}
