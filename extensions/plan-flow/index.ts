@@ -734,8 +734,7 @@ async function runApprovalDialog(pi: ExtensionAPI, ctx: ExtensionContext, curren
  * internal revision loop, not a user stop point: trigger an immediate follow-up turn so
  * the agent explains the rejection and calls plan_write again without waiting for a new
  * user prompt. Approval may synchronously transition to executing; execution kickoff is
- * still queued for the next prompt so the model does not call todo_write from a stale
- * tool snapshot. */
+ * also triggered as a follow-up turn so approval is not a user-visible stop point. */
 async function drivePostReview(pi: ExtensionAPI, ctx: ExtensionContext, state: PlanFlowState): Promise<void> {
 	if (state.phase === "revising") {
 		const issueCount = state.reviewFeedback?.blockingIssues.length ?? 0;
@@ -757,7 +756,7 @@ async function drivePostReview(pi: ExtensionAPI, ctx: ExtensionContext, state: P
 		applyActiveTools(pi, approved);
 		updatePlanUi(ctx, approved);
 		if (ctx.hasUI) ctx.ui.notify(`Plan auto-approved · ${approved.finalPath ?? ""}`, "info");
-		queueNextTurnInstruction(pi, "Plan approved. Begin execution: todo_write the first step as in_progress.");
+		continueExecutionTurn(pi, approved);
 		return;
 	}
 
@@ -769,7 +768,7 @@ async function drivePostReview(pi: ExtensionAPI, ctx: ExtensionContext, state: P
 	const outcome = await runApprovalDialog(pi, ctx, state);
 	if (outcome.kind === "approved") {
 		ctx.ui.notify(`Plan approved · ${outcome.state.finalPath ?? ""}`, "info");
-		queueNextTurnInstruction(pi, "Plan approved. Begin execution: todo_write the first step as in_progress.");
+		continueExecutionTurn(pi, outcome.state);
 		return;
 	}
 	if (outcome.kind === "revising") {
@@ -875,6 +874,14 @@ function applyActiveTools(pi: ExtensionAPI, state: PlanFlowState) {
 	pi.setActiveTools(getAllowedToolsForState(state));
 }
 
+function buildCompactPlanWidget(state: PlanFlowState): string[] {
+	return [
+		`Plan ${state.planId} · ${state.phase}`,
+		state.title ? `Title: ${state.title}` : `Request: ${state.request}`,
+		`${state.steps.length} step(s)${state.phase === "awaiting_approval" ? " · awaiting approval" : ""} · /plan-debug for details`,
+	];
+}
+
 function updatePlanUi(ctx: ExtensionContext, state: PlanFlowState) {
 	if (!ctx.hasUI) return;
 	if (!state.active || state.phase === "aborted") {
@@ -894,11 +901,7 @@ function updatePlanUi(ctx: ExtensionContext, state: PlanFlowState) {
 		return;
 	}
 	ctx.ui.setStatus("yuki-plan", `plan ${state.phase}`);
-	if (state.steps.length > 0) {
-		ctx.ui.setWidget("yuki-plan", state.steps.map((step, index) => `${index + 1}. ${step.content}`));
-	} else {
-		ctx.ui.setWidget("yuki-plan", [`Plan ${state.planId}`, `Phase: ${state.phase}`, `Request: ${state.request}`]);
-	}
+	ctx.ui.setWidget("yuki-plan", buildCompactPlanWidget(state));
 }
 
 /** Start an immediate hidden continuation turn.
@@ -930,6 +933,18 @@ function continueRevisionTurn(pi: ExtensionAPI, state: PlanFlowState, issueText:
 				"Blocking issues:",
 				issueText,
 			].join("\n"),
+		},
+		{ deliverAs: "followUp", triggerTurn: true },
+	);
+}
+
+/** Start execution immediately after approval using the freshly narrowed execution tools. */
+function continueExecutionTurn(pi: ExtensionAPI, state: PlanFlowState) {
+	pi.sendMessage(
+		{
+			customType: PLAN_KICK_CUSTOM_TYPE,
+			display: false,
+			content: `Plan approved. Begin execution now: call todo_write to mark the first step in_progress for list ${state.todoListId}.`,
 		},
 		{ deliverAs: "followUp", triggerTurn: true },
 	);

@@ -54,4 +54,13 @@ describe("plan-flow v2 integration guards", () => {
 		assert.match(source, /MAX_REVIEW_REVISION_ATTEMPTS/);
 		assert.match(source, /function publishRevisionLoopStop/);
 	});
+
+	it("continues execution immediately after approval and keeps the plan widget compact", () => {
+		assert.match(source, /function continueExecutionTurn[\s\S]*deliverAs: "followUp"[\s\S]*triggerTurn: true/);
+		assert.match(source, /continueExecutionTurn\(pi, approved\)/);
+		assert.match(source, /continueExecutionTurn\(pi, outcome\.state\)/);
+		assert.doesNotMatch(source, /Plan approved\. Begin execution[\s\S]{0,120}deliverAs: "nextTurn"/);
+		assert.match(source, /function buildCompactPlanWidget/);
+		assert.doesNotMatch(source, /state\.steps\.map\(\(step, index\) => `\$\{index \+ 1\}\. \$\{step\.content\}`\)/);
+	});
 });
