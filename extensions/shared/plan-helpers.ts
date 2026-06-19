@@ -121,17 +121,39 @@ export const TODO_TOOLS = ["todo_read", "todo_write"];
  * applied at a turn boundary (A-class). For B-class (tool-execute) transitions
  * the model is still mid-turn with the previous tool set, so this is the contract
  * the `tool_call` block defends mid-turn and that takes effect on the next turn.
+ *
+ * `options.hasOpenGrillingQuestions` enables state-sensitive narrowing for the
+ * grilling phase: when there are no unresolved questions, `grill_plan` and
+ * `plan_ask` are removed and only `grill_done` (+ read-only) is exposed. Without
+ * this the model keeps re-calling `grill_plan` after it already returned "no open
+ * questions", because the next turn's tool surface still listed `grill_plan` (the
+ * grilling wrong-tool loop incident, 2026-06-19).
  */
-export function getAllowedToolsForState(phase: string, previousActiveTools: string[] = []): string[] {
+export function getAllowedToolsForState(
+	phase: string,
+	previousActiveTools: string[] = [],
+	options: { hasOpenGrillingQuestions?: boolean } = {},
+): string[] {
 	const base = new Set<string>();
 	if (phase === "research") {
 		for (const tool of previousActiveTools) if (READ_ONLY_TOOLS.has(tool)) base.add(tool);
 		base.add("grill_plan");
 	} else if (phase === "grilling") {
-		for (const tool of previousActiveTools) if (READ_ONLY_TOOLS.has(tool)) base.add(tool);
-		base.add("plan_ask");
-		base.add("grill_plan");
-		base.add("grill_done");
+		if (options.hasOpenGrillingQuestions) {
+			// Questions still to resolve: allow reading (to formulate questions), asking,
+			// re-grilling, and finishing.
+			for (const tool of previousActiveTools) if (READ_ONLY_TOOLS.has(tool)) base.add(tool);
+			base.add("plan_ask");
+			base.add("grill_plan");
+			base.add("grill_done");
+		} else {
+			// No open questions: the ONLY productive next action is grill_done. Exposing
+			// read/grep/grill_plan here let the model re-call grill_plan (grilling wrong-tool
+			// loop, 2026-06-19) or burn turns on redundant read-only research. The clean turn
+			// must offer exactly grill_done so the model converges. (If more research is truly
+			// needed, that is a restart_research state transition, not a grilling-no-open turn.)
+			base.add("grill_done");
+		}
 	} else if (phase === "drafting" || phase === "revising") {
 		base.add("plan_write");
 	} else if (phase === "awaiting_approval") {
@@ -161,4 +183,73 @@ export function checkMandatoryValidation(stepValidations: string[][], mandatory:
 	if (union.trim() === "") return { ok: false, missing: [...mandatory] };
 	const missing = mandatory.filter((item) => !union.includes(item.toLowerCase()));
 	return { ok: missing.length === 0, missing };
+}
+
+/**
+ * rev.4 P0: convergence guard input. The turn_end handler builds this from the
+ * current plan state (+ todo state for executing) and calls getConvergenceKick to
+ * decide whether the model ended a turn without making the expected next tool call.
+ *
+ * `allTodosPending` is only meaningful for the executing phase; callers should pass
+ * `true` only when every plan-owned todo is still `pending` (no `todo_write` has ever
+ * run for this plan). `planningContextGuidance` / `reviewIssuesText` are optional
+ * rich-text fragments appended to the drafting / revising kick content.
+ */
+export interface ConvergenceSignal {
+	phase: string;
+	reviewPending?: boolean;
+	reviewed?: boolean;
+	approved?: boolean;
+	todoListId?: string;
+	allTodosPending?: boolean;
+	/** Whether any grilling question is still unresolved (status "open"). Only
+	 * meaningful for the grilling phase; pass false/undefined otherwise. */
+	hasOpenQuestions?: boolean;
+	planningContextGuidance?: string;
+	reviewIssuesText?: string;
+}
+
+/**
+ * Return the kick content for a no-progress turn_end in a constrained phase, or
+ * `undefined` when the phase made progress (or is unconstrained and should not be
+ * auto-kicked). Pure so the rev.4 convergence contract can be unit tested.
+ *
+ * Why this exists: B-class (tool-execute) transitions like grill_done -> drafting do
+ * NOT start a clean new turn, and `setActiveTools` does not narrow the current
+ * (streaming) turn's tool set. So when the model ends such a turn without calling the
+ * expected next tool, the flow used to stall until the user typed "继续" (incident #3),
+ * and the stale mid-turn tool set still exposed disallowed tools like `plan_ask` so the
+ * model kept retrying them (incident #2). Re-kicking a clean, narrowed turn (A-class)
+ * both removes the disallowed tool from the model's view and auto-continues the flow.
+ */
+export function getConvergenceKick(signal: ConvergenceSignal): string | undefined {
+	if (signal.phase === "grilling") {
+		// rev.4 P0: auto-continue grilling once there are no unresolved questions, so the
+		// flow does not stall until the user types "继续" (incident #3: "停下来问 ok，我说
+		// 继续，然后它才 grill_done"). When questions remain open, leave it unconstrained so
+		// the model can keep reading or call plan_ask without a nudge. grill_plan always
+		// transitions research -> grilling, so reaching grilling implies grill_plan ran.
+		if (signal.hasOpenQuestions) return undefined;
+		return "yuki plan-flow: grilling has no unresolved questions. Call grill_done to proceed to drafting.";
+	}
+	if (signal.phase === "drafting") {
+		// reviewPending true  -> plan_write was called; the review turn_end handler owns the next step.
+		// reviewed   true     -> review already ran; drivePostReview owns the next step.
+		if (signal.reviewPending || signal.reviewed) return undefined;
+		return `yuki plan-flow: still in drafting. Call plan_write with the structured plan now.${signal.planningContextGuidance ?? ""}`;
+	}
+	if (signal.phase === "revising") {
+		return `yuki plan-flow: still in revising. Call plan_write with the revised plan addressing the review feedback.\nBlocking issues:\n${signal.reviewIssuesText ?? "Review requested changes."}`;
+	}
+	if (signal.phase === "awaiting_approval") {
+		if (signal.approved) return undefined;
+		return "yuki plan-flow: plan is ready for approval; call plan_exit to approve it.";
+	}
+	if (signal.phase === "executing") {
+		// Only nudge if NO todo has been touched yet. Once execution has started the model
+		// does legitimate multi-turn read/bash work and must NOT be re-kicked every turn.
+		if (!signal.todoListId || !signal.allTodosPending) return undefined;
+		return `yuki plan-flow: plan approved. Begin execution now: call todo_write to mark the first step in_progress for list ${signal.todoListId}.`;
+	}
+	return undefined;
 }

@@ -322,19 +322,85 @@ Incident doc in Skywalker:
 docs/plan-flow-incident-analysis-2026-06-18.md
 ```
 
+## Re-test after plan-flow optimisation
+
+Date: 2026-06-19  
+Plan todo list: `plan-20260619-112148-dd9ce35c`
+
+Optimisations observed in source/runtime:
+
+- `/ta-dev` writes a compact one-shot planning context under `.pi/plan-context/<token>.json` and pre-fills `/plan --context <token> ...`, avoiding huge visible `/plan` prompts.
+- `/plan` can load structured planning context via `--context`.
+- plan-flow has a `turn_end` auto-close path for executing plans whose plan-owned todos are all completed.
+- blocked-tool wording changed from high-pressure `STOP ... rejected Nx` to a calmer message: `yuki plan-flow: in phase drafting, the next tool to call is: plan_write.`
+
+Re-test result:
+
+1. Research/grill path worked and recognised the optimised `/ta-dev` + `/plan --context` handoff.
+2. The wrong-tool loop still reproduced in drafting: the agent repeatedly called `plan_ask` even though the blocker calmly said the next tool was `plan_write`.
+3. User said “继续”; agent then successfully called `plan_write`.
+4. Approval entered executing. The agent initially miscalled `plan_write` in executing, but recovered once the todo list id was known.
+5. Execution succeeded: only C# probe comment was modified; C# compile passed; `sensor_evidence_read` was called; plan-owned todo completed with fresh evidence:
+
+```text
+TA Harness evidence: unity-csharp-compile passed; at 2026-06-19T03:27:02.975Z; fingerprint=011f6120f417f22e; file=client/skywalker/Assets/PiGuardProbe/PiGuardBrokenCSharp.cs; summary=unity-csharp-compile: pass - C# compilation passed.
+```
+
+6. Auto-close worked immediately after completion: attempting to reopen the completed plan todo failed with:
+
+```text
+todo_write: plan-owned todo lists may only be updated while their owning plan is executing.
+```
+
+This confirms the completed executing plan was no longer considered executing for plan-owned todo writes.
+
+7. Probe comment was restored to baseline outside the plan-owned todo because the plan had already auto-closed. A fresh C# compile pass for the restored file was observed:
+
+```text
+unity-csharp-compile pass at 2026-06-19T03:28:03.125Z; fingerprint=011f6120f417f22e
+```
+
+Updated conclusions:
+
+- The `/ta-dev` structured-context handoff is better and avoids visible prompt bloat.
+- Auto-close solves the old “completed plan blocks new /plan until /plan-abort” problem, but it can close before cleanup/restoration steps if the agent marks the only todo completed too early.
+- Calmer blocked-tool text improves UX but does not stop model wrong-tool loops. Root fix likely needs phase-specific active tool narrowing, automatic recovery, or hiding disallowed tools from the model.
+- Executing phase has the same class of issue: if only todo tools are valid, exposing/calling plan tools still causes avoidable blocked calls.
+
+Backlog adjustment from re-test:
+
+- Keep P0 for stricter phase tool narrowing/recovery.
+- Add a cleanup convention: for smoke tests that restore probe files, either include restoration as a separate plan step or delay completed until final restored-file evidence is available. Otherwise auto-close prevents updating final evidence after cleanup.
+
+## rev.4 fixes (2026-06-19)
+
+Addressed the three issues reported after the re-test:
+
+1. **Double-Enter `/ta-dev` → `/plan` handoff (incident #1).** Root cause: `pi.sendUserMessage("/plan ...")` deliberately calls `prompt(text, { expandPromptTemplates: false })`, which skips slash-command handling, so programmatic callers cannot trigger `/plan` that way. The previous workaround prefilled the editor via `setEditorText`, forcing a second Enter. Fix: plan-flow now exports a programmatic entry point `startPlanFlow(pi, ctx, { request, planningContext })` (and the `PlanningContext` type) so callers like `/ta-dev` can start a plan directly — no editor prefill, no second Enter, and no `--context` handoff file needed (the context can be passed inline). The `/plan` command handler was refactored to delegate to the same function.
+2. **Drafting keeps calling `plan_ask` (incident #2).** Root cause: B-class (tool-execute) transitions like `grill_done → drafting` do NOT start a clean new turn, and `setActiveTools` does not narrow the current streaming turn's tool set, so `plan_ask` stays visible mid-turn and the model keeps retrying it. Fix: a new `turn_end` convergence guard (`getConvergenceKick` in `extensions/shared/plan-helpers.ts`, wired in `extensions/plan-flow/index.ts`) detects no-progress turns in drafting/revising/awaiting_approval/executing and re-kicks a clean, narrowed turn (A-class) where the disallowed tool is no longer presented to the model at all. The blocked-tool reason also escalates after 2 consecutive blocks to a short, action-only message that names only the allowed tool.
+3. **Flow stops mid-way and waits for "继续" (incident #3).** Same convergence guard: instead of stalling until the user types "继续", the flow auto-continues by re-kicking the narrowed turn. A per-plan counter caps auto-kicks at `MAX_CONVERGENCE_KICKS = 3`; after that it surfaces a visible notify and leaves the plan for the user to `/plan-debug`, `/plan-abort`, or continue manually, avoiding an infinite kick loop.
+
+Regression coverage added in `test/plan-helpers.test.ts` for the pure `getConvergenceKick` contract (per-phase kick / no-kick decisions).
+
+Remaining (not addressed in rev.4):
+
+- True mid-turn active-tool narrowing (hiding disallowed tools from the current streaming turn) requires a pi runtime change; the convergence guard is the in-scope equivalent because it re-kicks a clean turn where narrowing already applies.
+- Executing-phase cleanup convention for smoke tests that restore probe files (see backlog adjustment above).
+- `/ta-dev` itself (in the Skywalker project) must be updated to call `startPlanFlow` instead of `setEditorText("/plan ...")` to actually eliminate the double-Enter; yuki-pi now provides the API.
+
 ## Proposed yuki-pi optimisation backlog
 
 ### P0
 
-1. Add explicit completed/close path for executing plans whose todos are all completed.
-2. Strengthen repeated blocked-tool recovery in drafting/revising/awaiting_approval.
+1. ~~Add explicit completed/close path for executing plans whose todos are all completed.~~ Done (rev.3 P1-1).
+2. ~~Strengthen repeated blocked-tool recovery in drafting/revising/awaiting_approval.~~ Done (rev.4 convergence guard + blocked-reason escalation).
 3. Make blocked-tool response structured and visible in UI.
 
 ### P1
 
-1. Add first-class command handoff API or document command handoff limitations clearly.
+1. ~~Add first-class command handoff API or document command handoff limitations clearly.~~ Done (rev.4 `startPlanFlow` export).
 2. Improve executing-phase guidance around sensor pass messages + `sensor_evidence_read` + `todo_write`.
-3. Add `/plan-status` or `/plan-debug` showing phase, allowed tools, next action, plan id, todo list id.
+3. ~~Add `/plan-status` or `/plan-debug` showing phase, allowed tools, next action, plan id, todo list id.~~ Done (rev.3 `/plan-debug`).
 
 ### P2
 

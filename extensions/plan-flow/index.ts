@@ -7,7 +7,7 @@ import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { createTodoState, makeTodoStateRecord, reconstructTodoStates } from "../todo/index.ts";
 import { PLAN_STATE_CUSTOM_TYPE, TODO_STATE_CUSTOM_TYPE } from "../shared/constants.ts";
-import { checkMandatoryValidation, getAllowedToolsForState as getAllowedToolsForPhase, isExecutableResolution, parsePlanCommandArgs, slugify } from "../shared/plan-helpers.ts";
+import { checkMandatoryValidation, getAllowedToolsForState as getAllowedToolsForPhase, getConvergenceKick, isExecutableResolution, parsePlanCommandArgs, slugify } from "../shared/plan-helpers.ts";
 
 export { PLAN_STATE_CUSTOM_TYPE };
 
@@ -48,7 +48,7 @@ interface ReviewFeedback {
 	raw?: string;
 }
 
-interface PlanningContext {
+export interface PlanningContext {
 	/** Originating command, e.g. "/ta-dev". */
 	sourceCommand?: string;
 	/** Declared profiles, e.g. ["csharp", "shader"]. */
@@ -170,6 +170,23 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 	// retry counters — a reload starts fresh, which is fine for a steering hint.
 	let consecutiveBlockedToolCalls = 0;
 
+	// rev.4 P0: convergence guard. B-class (tool-execute) transitions (grill_done ->
+	// drafting, plan_write -> awaiting_approval/revising, plan_exit -> executing) do NOT
+	// start a clean new turn, and setActiveTools does not narrow the current (streaming)
+	// turn's tool set. When the model ends such a turn without calling the expected next
+	// tool, the flow used to stall until the user typed "继续" (incident #3), and the stale
+	// mid-turn tool set still exposed disallowed tools like plan_ask so the model kept
+	// retrying them (incident #2). The convergence turn_end handler below detects these
+	// no-progress turns and re-kicks a clean, narrowed turn (A-class) so the disallowed
+	// tool is no longer presented to the model and the flow auto-continues.
+	//
+	// `convergenceKicks` counts consecutive no-progress re-kicks per plan id. A progress
+	// turn (reviewPending flipped, phase advanced, first todo touched) resets it. After
+	// MAX_CONVERGENCE_KICKS we stop auto-kicking and surface a visible notify so the user
+	// can /plan-abort or continue manually, avoiding an infinite kick loop.
+	const convergenceKicks = new Map<string, number>();
+	const MAX_CONVERGENCE_KICKS = 3;
+
 	pi.registerCommand("plan", {
 		description: "Start yuki plan-flow for a requested change: /plan [--context <token>] <request>",
 		handler: async (args, ctx) => {
@@ -197,46 +214,7 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			}
 
 			const request = parsed.request;
-			const existing = reconstructPlanState(ctx);
-			if (existing?.active && existing.phase !== "aborted") {
-				ctx.ui.notify(`A yuki plan is already active (${existing.phase}). Use /plan-abort first.`, "warning");
-				return;
-			}
-
-			const now = new Date().toISOString();
-			const previousActiveTools = pi.getActiveTools();
-			const state: PlanFlowState = {
-				version: 1,
-				active: true,
-				phase: "research",
-				planId: createPlanId(),
-				request,
-				planningContext,
-				previousActiveTools,
-				currentActiveTools: [],
-				questions: [],
-				askCount: 0,
-				maxAskCount: 5,
-				steps: [],
-				risks: [],
-				reviewed: false,
-				reviewPending: false,
-				approved: false,
-				draftPath: "",
-				createdAt: now,
-				updatedAt: now,
-			};
-			state.draftPath = `.pi/plan-draft-${state.planId}.md`;
-			state.currentActiveTools = getAllowedToolsForState(state);
-
-			// rev.3 P0-1: drive the first turn with a display:false kick instead of a
-			// visible sendUserMessage. The command handler itself does not start a turn
-			// (slash commands execute and return without prompting), and at this point the
-			// agent is not streaming, so advancePhase's sendMessage(triggerTurn) starts a
-			// clean, narrowed research turn with zero visible noise. The detailed research
-			// instructions come from before_agent_start -> buildPhasePrompt (research).
-			ctx.ui.notify(`yuki plan-flow started · phase: research · plan ${state.planId}`, "info");
-			advancePhase(pi, ctx, state, buildKickoffContent(state), "plan_start");
+			await startPlanFlow(pi, ctx, { request, planningContext });
 		},
 	});
 
@@ -326,6 +304,18 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 				reason: "yuki plan-flow: automatic review in progress; wait for the review result before calling plan_write again.",
 			};
 		}
+		// rev.7 P0: NEVER block plan tools. A blocked call returns createErrorToolResult with
+		// NO `terminate`, and shouldTerminateToolBatch is all-or-nothing, so a blocked plan
+		// tool never ends the turn — the model keeps retrying it on the frozen mid-turn tool
+		// surface (drafting/grilling wrong-tool loops). Instead, plan tools always execute and
+		// return terminate:true (with a decisive "call X instead" message on a wrong phase —
+		// see buildWrongPhaseResult). The clean-turn surface from setActiveTools is what
+		// actually narrows: in a clean turn a wrong plan tool is simply not offered, so the
+		// model cannot pick it. Letting plan tools run+terminate here is the hard constraint.
+		if (PLAN_TOOLS.has(event.toolName)) {
+			consecutiveBlockedToolCalls = 0;
+			return;
+		}
 		const allowed = getAllowedToolsForState(state);
 		if (!allowed.includes(event.toolName)) {
 			consecutiveBlockedToolCalls += 1;
@@ -335,6 +325,69 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			};
 		}
 		consecutiveBlockedToolCalls = 0;
+	});
+
+	// rev.4 P0: convergence guard. Registered BEFORE the drafting-review turn_end
+	// handler so that on the plan_write turn_end we see drafting+reviewPending (a
+	// progress signal) and reset the counter instead of double-kicking alongside
+	// drivePostReview. See getConvergenceKick for the per-phase progress contract.
+	pi.on("turn_end", async (_event, ctx) => {
+		const state = reconstructPlanState(ctx);
+		if (!state) return;
+		// Clean up the counter for any terminal/inactive state (aborted, completed, idle).
+		if (!state.active || state.phase === "aborted" || state.phase === "completed") {
+			convergenceKicks.delete(state.planId);
+			return;
+		}
+
+		let allTodosPending = false;
+		if (state.phase === "executing" && state.todoListId) {
+			const todos = reconstructTodoStates(ctx).get(state.todoListId)?.todos ?? [];
+			allTodosPending = todos.length > 0 && todos.every((todo) => todo.status === "pending");
+		}
+		const hasOpenQuestions = state.questions.some((question) => question.status === "open");
+
+		const kick = getConvergenceKick({
+			phase: state.phase,
+			reviewPending: state.reviewPending,
+			reviewed: state.reviewed,
+			approved: state.approved,
+			todoListId: state.todoListId,
+			allTodosPending,
+			hasOpenQuestions,
+			planningContextGuidance: renderPlanningContextGuidance(state),
+			reviewIssuesText: formatReviewIssues(state),
+		});
+
+		if (!kick) {
+			// Progress (or unconstrained phase): reset the consecutive no-progress counter.
+			convergenceKicks.delete(state.planId);
+			return;
+		}
+
+		// rev.5 P0: re-narrow the active tool set before kicking so the new turn's tool
+		// surface matches the convergence target (e.g. grilling with no open questions ->
+		// grill_done only). Without this the kick could start a turn that still exposes the
+		// tool the model kept mis-calling (grilling wrong-tool loop). setActiveToolsByName
+		// persists into agent.state.tools, which the new turn's createContextSnapshot reads.
+		applyActiveTools(pi, state);
+
+		const count = (convergenceKicks.get(state.planId) ?? 0) + 1;
+		if (count > MAX_CONVERGENCE_KICKS) {
+			// Stop auto-kicking to avoid an infinite loop; surface the stall to the user.
+			ctx.ui.notify(
+				`yuki plan-flow: stalled in ${state.phase} after ${MAX_CONVERGENCE_KICKS} auto-continues. Use /plan-debug, /plan-abort, or tell me to continue.`,
+				"warning",
+			);
+			return;
+		}
+		convergenceKicks.set(state.planId, count);
+		// A-class: turn has ended (!isStreaming), so kickTurn starts a clean, narrowed
+		// turn. The narrowed tool set (e.g. plan_write only in drafting) takes effect on
+		// this new turn, so the disallowed tool the model kept retrying is no longer
+		// presented. This is the real fix for incident #2 (drafting plan_ask loop) and
+		// #3 (flow stops until the user types "继续").
+		kickTurn(pi, kick);
 	});
 
 	pi.on("turn_end", async (_event, ctx) => {
@@ -391,13 +444,28 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const current = reconstructPlanState(ctx);
 			if (!current?.active || current.phase === "aborted") throw new Error("grill_plan: no active yuki plan.");
-			if (!["research", "grilling"].includes(current.phase)) throw new Error(`grill_plan: cannot run during phase ${current.phase}.`);
+			// rev.7: wrong-phase returns a terminating "call X instead" result instead of
+			// throwing. A throw -> createErrorToolResult has no `terminate`, so the frozen
+			// mid-turn surface would let the model retry grill_plan forever (wrong-tool loop).
+			if (!["research", "grilling"].includes(current.phase)) {
+				return buildWrongPhaseResult("grill_plan", current);
+			}
 			const next = applyGrillPlan(current, params);
 			applyActiveTools(pi, next);
 			updatePlanUi(ctx, next);
+			// rev.5 P0: terminate the turn after grill_plan so the convergence guard can
+			// re-kick a clean, state-narrowed grilling turn. When grill_plan records no open
+			// questions, applyActiveTools above narrows the NEXT turn's tool surface to
+			// grill_done only (state-sensitive narrowing in getAllowedToolsForState). But the
+			// CURRENT turn's tool surface is frozen (see grill_done terminate note), so if we
+			// let the turn continue the model could re-call grill_plan — the grilling wrong-tool
+			// loop. terminate:true forces turn_end, where the convergence guard kicks a clean
+			// turn exposing only grill_done (no open questions) or grill_plan/plan_ask/grill_done
+			// (open questions remain). Same hard-constraint pattern as grill_done / plan_write.
 			return {
 				content: [{ type: "text" as const, text: buildGrillPlanResult(next) }],
 				details: { state: next },
+				terminate: true,
 			};
 		},
 	});
@@ -415,14 +483,38 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const current = reconstructPlanState(ctx);
 			if (!current?.active || current.phase === "aborted") throw new Error("plan_ask: no active yuki plan.");
-			if (current.phase !== "grilling") throw new Error(`plan_ask: questions are only allowed during grilling, not ${current.phase}.`);
-			if (current.askCount >= current.maxAskCount) throw new Error("plan_ask: question limit reached; call grill_done and proceed with explicit assumptions.");
-			if (!ctx.hasUI) throw new Error("plan_ask: interactive UI is required to ask the user.");
+			// rev.7: each guard below returns a terminating result instead of throwing.
+			// A throw -> createErrorToolResult has no `terminate`, so the frozen mid-turn
+			// surface would let the model retry plan_ask forever (wrong-tool loop). The
+			// terminating result ends the turn; the convergence guard then kicks a clean,
+			// narrowed turn exposing only the correct tool.
+			if (current.phase !== "grilling") {
+				return buildWrongPhaseResult("plan_ask", current);
+			}
+			if (current.askCount >= current.maxAskCount) {
+				return buildWrongPhaseResult("plan_ask", current, `question limit ${current.maxAskCount} reached`);
+			}
+			if (!ctx.hasUI) {
+				return buildWrongPhaseResult("plan_ask", current, "no interactive UI available");
+			}
 
 			const answer = await askPlanQuestion(ctx, params);
-			if (!answer) throw new Error("plan_ask: user did not answer.");
+			if (!answer) {
+				// User dismissed the input. Terminate so the flow does not stall; the
+				// convergence guard will re-kick grilling (or the user can /plan-abort).
+				return buildWrongPhaseResult("plan_ask", current, "user did not answer");
+			}
 			const next = recordPlanAnswer(current, params, answer);
 			updatePlanUi(ctx, next);
+			// NOTE: plan_ask does NOT terminate on a successful ask. Unlike grill_plan /
+			// grill_done / plan_write, a successful plan_ask leaves the flow in grilling
+			// (possibly with more open questions), and the grilling tool surface is already
+			// all-valid (plan_ask / grill_plan / grill_done + read-only), so there is no
+			// wrong-tool loop to break. Terminating here would stall the flow between
+			// questions: the convergence guard only kicks grilling when there are NO open
+			// questions, so after a single ask with remaining open questions the turn would
+			// end with no kick and the user would have to type "继续" (incident #3 regression).
+			// Let the model keep asking or call grill_done within this turn.
 			return {
 				content: [{ type: "text" as const, text: `User answered '${params.topic}': ${answer}` }],
 				details: { state: next, answer },
@@ -439,17 +531,32 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const current = reconstructPlanState(ctx);
 			if (!current?.active || current.phase === "aborted") throw new Error("grill_done: no active yuki plan.");
-			if (!["research", "grilling"].includes(current.phase)) throw new Error(`grill_done: cannot run during phase ${current.phase}.`);
+			// rev.7: wrong-phase returns a terminating result instead of throwing (a throw
+			// has no `terminate` -> frozen-surface retry loop). See buildWrongPhaseResult.
+			if (!["research", "grilling"].includes(current.phase)) {
+				return buildWrongPhaseResult("grill_done", current);
+			}
 			const next = touch({ ...current, phase: "drafting" });
 			applyActiveTools(pi, next);
 			updatePlanUi(ctx, next);
-			// rev.3 B-class (tool-execute) transition: triggerTurn would degrade to steer here,
-			// so we do not start a new turn. The decisive result text guides the model to
-			// converge on plan_write within this turn; the narrowed tool set (plan_write only)
-			// takes effect on the next turn. block defends mid-turn if the model retries plan_ask.
+			// rev.4 P0 hard constraint: return terminate:true so the agent loop ends this
+			// turn immediately after grill_done. This is the real fix for the drafting
+			// plan_ask loop (incident #2). Background: grill_done is a B-class (tool-execute)
+			// transition into drafting, but the current turn's tool surface is FROZEN at the
+			// grilling set (createContextSnapshot is taken once per runPromptMessages; the
+			// Agent class does not re-snapshot tools mid-turn and exposes no prepareNextTurn
+			// that re-narrows). So if the turn kept going, the model would still see plan_ask
+			// (but NOT plan_write) and would retry plan_ask against the tool_call block — the
+			// observed deadloop. By terminating the turn here, control reaches turn_end, where
+			// the convergence guard kicks a CLEAN A-class drafting turn whose tool surface is
+			// only plan_write (applyActiveTools above set state.tools=[plan_write], which the
+			// new turn's createContextSnapshot picks up). The model then cannot call plan_ask
+			// at all and calls plan_write. terminate requires every result in the batch to set
+			// it; grill_done is normally called alone, so this is safe.
 			return {
-				content: [{ type: "text" as const, text: `Phase is now drafting. Grilling summary: ${params.summary}. Call plan_write with the structured plan.` }],
+				content: [{ type: "text" as const, text: `Phase is now drafting. Grilling summary: ${params.summary}. Ending turn; the next turn will expose only plan_write — call plan_write with the structured plan.` }],
 				details: { state: next, summary: params.summary },
+				terminate: true,
 			};
 		},
 	});
@@ -468,8 +575,10 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const current = reconstructPlanState(ctx);
 			if (!current?.active || current.phase === "aborted") throw new Error("plan_write: no active yuki plan. Start with /plan <request>.");
+			// rev.7: wrong-phase returns a terminating result instead of throwing (a throw
+			// has no `terminate` -> frozen-surface retry loop). See buildWrongPhaseResult.
 			if (!["drafting", "revising", "awaiting_approval"].includes(current.phase)) {
-				throw new Error(`plan_write: cannot write a plan during phase ${current.phase}. Finish research/grilling with grill_done first.`);
+				return buildWrongPhaseResult("plan_write", current);
 			}
 
 			const next = applyPlanWrite(current, params);
@@ -477,9 +586,14 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			applyActiveTools(pi, next);
 			updatePlanUi(ctx, next);
 
+			// rev.4 P0: terminate the turn after plan_write so the automatic review
+			// (drafting) / approval drive (revising) runs at turn_end immediately, and the
+			// model cannot re-call plan_write or stray tools in a stale frozen tool surface.
+			// Same hard constraint as grill_done: see AgentToolResult.terminate.
 			return {
 				content: [{ type: "text" as const, text: buildPlanWriteResult(next) }],
 				details: { state: next },
+				terminate: true,
 			};
 		},
 		renderCall(args, theme) {
@@ -507,8 +621,14 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const current = reconstructPlanState(ctx);
 			if (!current?.active || current.phase === "aborted") throw new Error("plan_exit: no active yuki plan.");
-			if (current.phase !== "awaiting_approval") throw new Error(`plan_exit: plan is not awaiting approval (phase=${current.phase}). Call plan_write first.`);
-			if (current.steps.length === 0) throw new Error("plan_exit: current plan has no steps.");
+			// rev.7: wrong-phase / no-steps return terminating results instead of throwing
+			// (a throw has no `terminate` -> frozen-surface retry loop). See buildWrongPhaseResult.
+			if (current.phase !== "awaiting_approval") {
+				return buildWrongPhaseResult("plan_exit", current);
+			}
+			if (current.steps.length === 0) {
+				return buildWrongPhaseResult("plan_exit", current, "plan has no steps");
+			}
 
 			// rev.3 P0-3/P0-4: plan_exit runs inside a tool execute() (streaming), so it is
 			// a B-class transition point — triggerTurn would degrade to a steer here. We do
@@ -526,23 +646,28 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 				return {
 					content: [{ type: "text" as const, text: `Plan auto-approved (headless) and saved to ${approved.finalPath}. A plan-owned todo list '${approved.todoListId}' was created. Begin execution with todo_write on the first step.` }],
 					details: { state: approved },
+					terminate: true,
 				};
 			}
 
 			const outcome = await runApprovalDialog(pi, ctx, current, params.message);
 			if (outcome.kind === "cancelled") {
-				return { content: [{ type: "text" as const, text: "Plan cancelled by user." }], details: { state: outcome.state } };
+				return { content: [{ type: "text" as const, text: "Plan cancelled by user." }], details: { state: outcome.state }, terminate: true };
 			}
 			if (outcome.kind === "revising") {
 				return {
 					content: [{ type: "text" as const, text: `User requested revision: ${outcome.revisionReason}\nCall plan_write with the revised plan.` }],
 					details: { state: outcome.state, revisionReason: outcome.revisionReason },
+					terminate: true,
 				};
 			}
 			// approved (B-class): decisive result guides the model to start todo_write.
+			// rev.7: terminate so the executing turn starts clean and narrowed (todo tools),
+			// instead of the model continuing on the frozen awaiting_approval surface.
 			return {
 				content: [{ type: "text" as const, text: `Plan approved and saved to ${outcome.state.finalPath}. A plan-owned todo list '${outcome.state.todoListId}' was created. Begin execution with todo_write on the first step.` }],
 				details: { state: outcome.state },
+				terminate: true,
 			};
 		},
 		renderCall(_args, theme) {
@@ -1049,7 +1174,9 @@ function renderPlanMarkdown(state: PlanFlowState): string {
 }
 
 function getAllowedToolsForState(state: PlanFlowState): string[] {
-	return getAllowedToolsForPhase(state.phase, state.previousActiveTools);
+	return getAllowedToolsForPhase(state.phase, state.previousActiveTools, {
+		hasOpenGrillingQuestions: state.phase === "grilling" && state.questions.some((question) => question.status === "open"),
+	});
 }
 
 function applyActiveTools(pi: ExtensionAPI, state: PlanFlowState) {
@@ -1115,19 +1242,91 @@ function advancePhase(pi: ExtensionAPI, ctx: ExtensionContext, next: PlanFlowSta
 	kickTurn(pi, kickContent);
 }
 
+/** rev.4 P1-1: programmatic entry point for callers like /ta-dev that want to start a
+ * yuki plan-flow WITHOUT going through the `/plan` slash command.
+ *
+ * Background: `pi.sendUserMessage("/plan ...")` deliberately skips slash-command
+ * handling (the runtime calls `prompt(text, { expandPromptTemplates: false })`), so a
+ * programmatic caller cannot trigger `/plan` that way. The previous workaround was to
+ * prefill the editor with `/plan ...` via `setEditorText`, which forces the user to
+ * press Enter a SECOND time (incident #1: "/ta-dev 回车后会先弄成 /plan 再回车才能发出去").
+ * Callers that instead call this function skip the editor entirely and start the
+ * research turn directly, so a single command submission is enough.
+ *
+ * Accepts the same `ctx` shape as the `/plan` command handler (ExtensionCommandContext
+ * extends ExtensionContext), and an optional pre-built `PlanningContext` so callers do
+ * not need to write+consume a `--context` handoff file either.
+ */
+export interface StartPlanFlowOptions {
+	request: string;
+	planningContext?: PlanningContext;
+}
+
+export async function startPlanFlow(pi: ExtensionAPI, ctx: ExtensionContext, opts: StartPlanFlowOptions): Promise<void> {
+	const request = opts.request.trim();
+	if (!request) {
+		ctx.ui.notify("yuki plan-flow: request is required.", "warning");
+		return;
+	}
+	const existing = reconstructPlanState(ctx);
+	if (existing?.active && existing.phase !== "aborted") {
+		ctx.ui.notify(`A yuki plan is already active (${existing.phase}). Use /plan-abort first.`, "warning");
+		return;
+	}
+
+	const now = new Date().toISOString();
+	const previousActiveTools = pi.getActiveTools();
+	const state: PlanFlowState = {
+		version: 1,
+		active: true,
+		phase: "research",
+		planId: createPlanId(),
+		request,
+		planningContext: opts.planningContext,
+		previousActiveTools,
+		currentActiveTools: [],
+		questions: [],
+		askCount: 0,
+		maxAskCount: 5,
+		steps: [],
+		risks: [],
+		reviewed: false,
+		reviewPending: false,
+		approved: false,
+		draftPath: "",
+		createdAt: now,
+		updatedAt: now,
+	};
+	state.draftPath = `.pi/plan-draft-${state.planId}.md`;
+	state.currentActiveTools = getAllowedToolsForState(state);
+
+	// rev.3 P0-1: drive the first turn with a display:false kick instead of a visible
+	// sendUserMessage. The command handler itself does not start a turn, and at this
+	// point the agent is not streaming, so advancePhase's sendMessage(triggerTurn)
+	// starts a clean, narrowed research turn with zero visible noise. The detailed
+	// research instructions come from before_agent_start -> buildPhasePrompt (research).
+	ctx.ui.notify(`yuki plan-flow started · phase: research · plan ${state.planId}`, "info");
+	advancePhase(pi, ctx, state, buildKickoffContent(state), "plan_start");
+}
+
 /** Compact one-line research kickoff (display:false, used by advancePhase at /plan start). */
 function buildKickoffContent(state: PlanFlowState): string {
 	return `Start yuki plan-flow research for: ${state.request}. Inspect files read-only with read/grep/find/ls, then call grill_plan with critical decision questions.`;
 }
 
-function buildBlockedToolReason(state: PlanFlowState, _toolName: string, allowed: string[], _attempts: number): string {
-	// rev.3: positive, non-pressure wording. The blocked tool name is intentionally
-	// omitted so the model is not re-primed toward it. The consecutive-block counter
-	// is kept for telemetry only (consecutiveBlockedToolCalls) and no longer escalates
-	// into a "STOP ... rejected Nx" pressure message, which read as a deadloop in the
-	// incident. block is the only real-time mid-turn defense for B-class (tool-execute)
-	// transitions, so it stays first-class but calm.
+function buildBlockedToolReason(state: PlanFlowState, _toolName: string, allowed: string[], attempts: number): string {
+	// rev.4: calm on the first block, then escalate to a short, action-only message
+	// that names only the ALLOWED tool. The blocked tool name is intentionally never
+	// mentioned (naming it re-primes the model toward the very tool we are narrowing
+	// away — the root of the drafting plan_ask deadloop in the incident). The mid-turn
+	// block is a stopgap; the real fix is the turn_end convergence guard, which re-kicks
+	// a clean narrowed turn so the disallowed tool is no longer presented at all.
 	const allowedList = allowed.length > 0 ? allowed.join(", ") : "(automatic review is running)";
+	if (attempts >= 2) {
+		// Short, direct, action-only. Repeating the long calm line verbatim read like a
+		// deadloop in the incident; escalate the wording instead of the pressure.
+		return `yuki plan-flow: call ${allowedList} next.`;
+	}
 	return `yuki plan-flow: in phase ${state.phase}, the next tool to call is: ${allowedList}.`;
 }
 
@@ -1140,6 +1339,36 @@ function nextActionHint(state: PlanFlowState): string {
 	if (state.phase === "awaiting_approval") return "Call plan_exit to open the approval dialog.";
 	if (state.phase === "executing") return `Use todo_read/todo_write on ${state.todoListId ?? "the plan-owned todo list"}.`;
 	return "Follow the yuki plan-flow phase prompt.";
+}
+
+/** rev.7 P0: a terminating "you called a plan tool in the wrong phase/state" result.
+ *
+ * Plan tools must NEVER throw on a phase mismatch and must NEVER be blocked by the
+ * tool_call handler. Background (confirmed by reading pi runtime source): a blocked
+ * tool call goes through the agent-loop `immediate` path and returns
+ * `createErrorToolResult(reason)`, which has NO `terminate` field; `shouldTerminateToolBatch`
+ * is all-or-nothing, so a blocked call never ends the turn. A thrown error is the same
+ * (createErrorToolResult, no terminate). Either way the current turn's tool surface is
+ * FROZEN (createContextSnapshot is taken once per runPromptMessages and never re-snapshotd
+ * mid-turn), so the model keeps retrying the same disallowed plan tool against the frozen
+ * surface — the drafting/grilling wrong-tool loops.
+ *
+ * Instead: plan tools always execute and return `terminate: true`. When called in the
+ * wrong phase/state, they return this decisive "call X instead" result AND end the turn.
+ * The turn_end convergence guard then kicks a clean, narrowed turn whose surface offers
+ * only the correct tool (setActiveTools), so the model physically cannot pick the wrong
+ * plan tool again. The clean-turn surface is the real hard constraint; this result makes
+ * the frozen-surface turn exit cleanly instead of loop-blocking. */
+function buildWrongPhaseResult(toolName: string, state: PlanFlowState, extra?: string): { content: Array<{ type: "text"; text: string }>; details: { state: PlanFlowState }; terminate: true } {
+	const hint = nextActionHint(state);
+	const text = extra
+		? `yuki plan-flow: ${toolName} is not valid right now (${extra}). ${hint} Ending this turn; the next turn will expose the correct tool.`
+		: `yuki plan-flow: ${toolName} is not valid in phase ${state.phase}. ${hint} Ending this turn; the next turn will expose the correct tool.`;
+	return {
+		content: [{ type: "text" as const, text }],
+		details: { state },
+		terminate: true,
+	};
 }
 
 function buildPhasePrompt(state: PlanFlowState): string {
