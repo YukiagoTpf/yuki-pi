@@ -125,6 +125,7 @@ type PlanWriteInput = Static<typeof PlanWriteParams>;
 export default function planFlowExtension(pi: ExtensionAPI) {
 	// Guards against running two automatic reviews concurrently within one process.
 	let reviewInFlight = false;
+	let approvalInFlight = false;
 	let activePlanBeforeCompact: PlanFlowState | undefined;
 	// Counts consecutive phase-discipline tool blocks so repeated wrong-tool calls escalate to a
 	// shorter, stronger steer. Re-emitting the identical message on every rejected call read like a
@@ -256,6 +257,16 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			ctx.ui.setStatus("yuki-plan", undefined);
 			ctx.ui.setWidget("yuki-plan", undefined);
 		}
+	});
+
+	pi.on("before_agent_start", async (_event, ctx) => {
+		const state = reconstructPlanState(ctx);
+		if (!state?.active || state.phase === "aborted" || state.phase === "completed") return;
+		// Last-chance tool refresh: input handlers can transition state, and queued
+		// extension follow-ups can be prepared before the prompt/tool surface catches up.
+		// Re-applying here guarantees the next model call sees the durable plan phase.
+		applyActiveTools(pi, state);
+		updatePlanUi(ctx, state);
 	});
 
 	pi.on("context", async (event, ctx) => {
@@ -397,6 +408,18 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			await drivePostReview(pi, ctx, reviewed);
 		} finally {
 			reviewInFlight = false;
+		}
+	});
+
+	pi.on("agent_end", async (_event, ctx) => {
+		const state = reconstructPlanState(ctx);
+		if (!state?.active || state.phase !== "awaiting_approval" || state.approvalMode !== "ui") return;
+		if (approvalInFlight) return;
+		approvalInFlight = true;
+		try {
+			await driveUiApproval(pi, ctx, state);
+		} finally {
+			approvalInFlight = false;
 		}
 	});
 
@@ -811,14 +834,38 @@ async function runApprovalDialog(pi: ExtensionAPI, ctx: ExtensionContext, curren
 	return { kind: "approved", state: approved };
 }
 
+async function driveUiApproval(pi: ExtensionAPI, ctx: ExtensionContext, state: PlanFlowState): Promise<void> {
+	if (!ctx.hasUI) {
+		await abortPlan(pi, ctx, state, "approvalMode ui requires an interactive UI");
+		return;
+	}
+
+	const current = reconstructPlanState(ctx);
+	if (!current?.active || current.phase !== "awaiting_approval" || current.planId !== state.planId) return;
+	const outcome = await runApprovalDialog(pi, ctx, current);
+	if (outcome.kind === "approved") {
+		const kicked = markExecutionKickSent(outcome.state);
+		persistPlanState(pi, kicked, "phase_change");
+		applyActiveTools(pi, kicked);
+		updatePlanUi(ctx, kicked);
+		ctx.ui.notify(`Plan approved · ${kicked.finalPath ?? ""}`, "info");
+		continueExecutionTurn(pi, kicked);
+		return;
+	}
+	if (outcome.kind === "revising") {
+		queueNextTurnInstruction(pi, "Address the revision request and call plan_write with the revised plan.");
+	}
+	// cancelled: abortPlan already persisted + cleared UI; no turn to kick.
+}
+
 /** Drive post-review state changes from the turn_end handler.
  *
  * `state` has already been persisted/narrowed/UI-updated by the caller for the
  * reviewing->revising/awaiting_approval transition. Blocking review feedback is an
  * internal revision loop, not a user stop point: trigger an immediate follow-up turn so
  * the agent explains the rejection and calls plan_write again without waiting for a new
- * user prompt. Approval may synchronously transition to executing; execution kickoff is
- * also triggered as a follow-up turn so approval is not a user-visible stop point. */
+ * user prompt. UI approval is deferred until agent_end so its history preview can render
+ * after streaming has stopped and before the compact approval controls open. */
 async function drivePostReview(pi: ExtensionAPI, ctx: ExtensionContext, state: PlanFlowState): Promise<void> {
 	if (state.phase === "revising") {
 		const issueCount = state.reviewFeedback?.blockingIssues.length ?? 0;
@@ -850,24 +897,9 @@ async function drivePostReview(pi: ExtensionAPI, ctx: ExtensionContext, state: P
 
 	if (!ctx.hasUI) {
 		await abortPlan(pi, ctx, state, "approvalMode ui requires an interactive UI");
-		return;
 	}
-
-	const outcome = await runApprovalDialog(pi, ctx, state);
-	if (outcome.kind === "approved") {
-		const kicked = markExecutionKickSent(outcome.state);
-		persistPlanState(pi, kicked, "phase_change");
-		applyActiveTools(pi, kicked);
-		updatePlanUi(ctx, kicked);
-		ctx.ui.notify(`Plan approved · ${kicked.finalPath ?? ""}`, "info");
-		continueExecutionTurn(pi, kicked);
-		return;
-	}
-	if (outcome.kind === "revising") {
-		queueNextTurnInstruction(pi, "Address the revision request and call plan_write with the revised plan.");
-		return;
-	}
-	// cancelled: abortPlan already persisted + cleared UI; no turn to kick.
+	// Interactive approval is run by the agent_end handler, outside the streaming
+	// turn_end path, so the markdown preview is appended visibly before controls open.
 }
 
 async function renderDraft(ctx: ExtensionContext, state: PlanFlowState) {

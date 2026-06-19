@@ -13,6 +13,14 @@ function extractDrivePostReviewRevisingBranch(): string {
 	return source.slice(start, end);
 }
 
+function extractHandler(eventName: string): string {
+	const start = source.indexOf(`pi.on("${eventName}"`);
+	const end = source.indexOf("\n\t});", start);
+	assert.notEqual(start, -1);
+	assert.notEqual(end, -1);
+	return source.slice(start, end);
+}
+
 describe("plan-flow v2 integration guards", () => {
 	it("exposes only plan_write as the model-facing yuki planning tool", () => {
 		assert.match(source, /const PLAN_TOOLS = new Set\(\["plan_write"\]\)/);
@@ -22,10 +30,13 @@ describe("plan-flow v2 integration guards", () => {
 		}
 	});
 
-	it("injects plan-mode policy through context rather than one-shot agent start", () => {
+	it("injects plan-mode policy through context and only uses before_agent_start for tool refresh", () => {
 		assert.match(source, /pi\.on\("context"/);
-		assert.doesNotMatch(source, /pi\.on\("before_agent_start"/);
 		assert.match(source, /PLAN_MODE_PROMPT_CUSTOM_TYPE/);
+		const beforeAgentStart = extractHandler("before_agent_start");
+		assert.match(beforeAgentStart, /applyActiveTools\(pi, state\)/);
+		assert.match(beforeAgentStart, /updatePlanUi\(ctx, state\)/);
+		assert.doesNotMatch(beforeAgentStart, /PLAN_MODE_PROMPT_CUSTOM_TYPE/);
 	});
 
 	it("requires explicit approvalMode for direct callers such as ta-dev", () => {
@@ -77,6 +88,9 @@ describe("plan-flow v2 integration guards", () => {
 		assert.match(source, /message\.customType === PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE/);
 		assert.match(source, /function publishApprovalPreview/);
 		assert.match(source, /customType: PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE[\s\S]*display: true/);
+		assert.match(source, /pi\.on\("agent_end"[\s\S]*driveUiApproval\(pi, ctx, state\)/);
+		assert.match(source, /function driveUiApproval/);
+		assert.match(source, /UI approval is deferred until agent_end/);
 		assert.match(source, /function renderApprovalPreviewMarkdown/);
 		assert.match(source, /renderPlanMarkdown\(state\)\.trim\(\)/);
 		assert.match(source, /publishApprovalPreview\(pi, current, message\)/);
