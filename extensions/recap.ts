@@ -114,8 +114,9 @@ export default function recapExtension(pi: ExtensionAPI) {
 			clearRecapWidget(ctx);
 		}
 
-		autoAbortController = mode === "auto" ? new AbortController() : undefined;
-		const signal = mode === "auto" ? autoAbortController.signal : ctx.signal;
+		const controller = mode === "auto" ? new AbortController() : undefined;
+		autoAbortController = controller;
+		const signal = controller?.signal ?? ctx.signal;
 		const recapActivityVersion = activityVersion;
 
 		inflight = (async () => {

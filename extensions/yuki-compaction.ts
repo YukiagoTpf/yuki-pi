@@ -555,7 +555,7 @@ async function pruneToolResult(
 }
 
 function pruneRuntimeMessage(message: AgentMessage, config: YukiCompactionConfig): AgentMessage {
-	const msg = message as Record<string, unknown>;
+	const msg = message as unknown as Record<string, unknown>;
 	if (msg.role !== "tool" && msg.role !== "toolResult") return message;
 	const text = messageToText(message);
 	if (text.length <= config.runtimeToolTextChars) return message;
@@ -963,7 +963,7 @@ function messageToText(message: unknown): string {
 }
 
 function withTextContent<T extends AgentMessage>(message: T, text: string): T {
-	const msg = message as Record<string, unknown>;
+	const msg = message as unknown as Record<string, unknown>;
 	if (Array.isArray(msg.content)) return { ...(message as object), content: [{ type: "text", text }] } as T;
 	if (typeof msg.content === "string") return { ...(message as object), content: text } as T;
 	if (typeof msg.output === "string") return { ...(message as object), output: text } as T;

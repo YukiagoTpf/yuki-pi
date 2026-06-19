@@ -126,9 +126,9 @@ function askWithOptions(
 	question: string,
 	options: QuestionOption[],
 	allowOther: boolean,
-	signal: AbortSignal,
+	signal?: AbortSignal,
 ): Promise<AskSelection | null> {
-	if (signal.aborted) return Promise.resolve(null);
+	if (signal?.aborted) return Promise.resolve(null);
 
 	return ctx.ui.custom<AskSelection | null>((tui, theme, _keybindings, done) => {
 		let selectedIndex = 0;
@@ -146,7 +146,7 @@ function askWithOptions(
 		};
 
 		const onAbort = () => finish(null);
-		signal.addEventListener("abort", onAbort, { once: true });
+		signal?.addEventListener("abort", onAbort, { once: true });
 
 		const refresh = () => {
 			cachedLines = undefined;
@@ -290,7 +290,7 @@ function askWithOptions(
 				cachedWidth = undefined;
 			},
 			dispose() {
-				signal.removeEventListener("abort", onAbort);
+				signal?.removeEventListener("abort", onAbort);
 			},
 		};
 

@@ -211,11 +211,11 @@ function formatMessage(message: AgentMessage): string | undefined {
 }
 
 function messageText(message: AgentMessage): string {
-	const content = message.content;
+	const content = (message as unknown as { content?: unknown }).content;
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
 	return content
-		.filter((part): part is { type: "text"; text: string } => part.type === "text")
+		.filter((part): part is { type: "text"; text: string } => typeof part === "object" && part !== null && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string")
 		.map((part) => part.text)
 		.join("\n");
 }
