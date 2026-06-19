@@ -1,7 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import os from "node:os";
-import path from "node:path";
 
 const BAR_WIDTH = 8;
 
@@ -66,11 +64,10 @@ function installStatusline(pi: ExtensionAPI, ctx: ExtensionContext) {
 			render(width: number): string[] {
 				const separator = theme.fg("dim", " | ");
 				const context = formatContext(ctx, theme);
-				const branch = theme.fg("accent", truncatePlain(footerData.getGitBranch() ?? "no-git", 18));
-				const model = theme.fg("muted", truncatePlain(formatModelWithEffort(pi, ctx), 34));
+				const branch = theme.fg("accent", footerData.getGitBranch() ?? "no-git");
+				const model = theme.fg("muted", truncatePlain(formatModelWithEffort(pi, ctx), 40));
 				const fixedWidth = visibleWidth(separator) * 3 + visibleWidth(branch) + visibleWidth(model) + visibleWidth(context);
-				const pathWidth = Math.max(8, width - fixedWidth);
-				const cwd = theme.fg("success", shortenPath(ctx.cwd, pathWidth));
+				const cwd = theme.fg("success", basename(ctx.cwd));
 				const primary = truncateToWidth(cwd + separator + branch + separator + model + separator + context, width);
 
 				const secondaryParts = [formatTokenStats(ctx, theme), formatExtensionStatuses(footerData.getExtensionStatuses())].filter(Boolean);
@@ -88,7 +85,13 @@ function modelName(ctx: ExtensionContext): string {
 
 function formatModelWithEffort(pi: ExtensionAPI, ctx: ExtensionContext): string {
 	const effort = formatEffort(pi.getThinkingLevel());
-	return `${modelName(ctx)} · ${effort}`;
+	const provider = providerName(ctx);
+	return provider ? `${modelName(ctx)} · ${provider} · ${effort}` : `${modelName(ctx)} · ${effort}`;
+}
+
+function providerName(ctx: ExtensionContext): string | undefined {
+	const model = ctx.model as { provider?: string } | undefined;
+	return model?.provider;
 }
 
 function formatEffort(level: string): string {
@@ -162,26 +165,10 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1_000_000)}M`;
 }
 
-function shortenPath(cwd: string, maxWidth: number): string {
-	const normalized = homeRelative(cwd).replace(/\\/g, "/");
-	if (visibleWidth(normalized) <= maxWidth) return normalized;
+function basename(cwd: string): string {
+	const normalized = cwd.replace(/\\/g, "/");
 	const parts = normalized.split("/").filter(Boolean);
-	if (parts.length <= 1) return truncatePlain(normalized, maxWidth);
-
-	const tail: string[] = [];
-	for (let i = parts.length - 1; i >= 0; i--) {
-		const candidate = `…/${[parts[i], ...tail].join("/")}`;
-		if (visibleWidth(candidate) > maxWidth) break;
-		tail.unshift(parts[i]);
-	}
-	return truncatePlain(`…/${tail.join("/")}`, maxWidth);
-}
-
-function homeRelative(cwd: string): string {
-	const home = os.homedir();
-	const relative = path.relative(home, cwd);
-	if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) return path.join("~", relative);
-	return cwd;
+	return parts[parts.length - 1] ?? cwd;
 }
 
 function truncatePlain(text: string, width: number): string {
