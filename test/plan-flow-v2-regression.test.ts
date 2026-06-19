@@ -61,6 +61,9 @@ describe("plan-flow v2 integration guards", () => {
 		assert.match(source, /markExecutionKickSent\(approved\)/);
 		assert.match(source, /markExecutionKickSent\(outcome\.state\)/);
 		assert.match(source, /executionKickSent: state\.executionKickSent/);
+		assert.match(source, /function buildExecutionKickContent/);
+		assert.match(source, /pi\.on\("input"[\s\S]*event\.source === "extension"[\s\S]*event\.streamingBehavior === "followUp"[\s\S]*applyActiveTools\(pi, state\)/);
+		assert.match(source, /state\.phase === "awaiting_approval"[\s\S]*isExecutionKickForPlan\(event\.text, state\)[\s\S]*approvePlan\(pi, ctx, state\)/);
 		assert.doesNotMatch(source, /Plan approved\. Begin execution[\s\S]{0,120}deliverAs: "nextTurn"/);
 		assert.match(source, /function buildCompactPlanWidget/);
 		assert.doesNotMatch(source, /state\.steps\.map\(\(step, index\) => `\$\{index \+ 1\}\. \$\{step\.content\}`\)/);

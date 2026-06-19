@@ -271,6 +271,27 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 		return { messages };
 	});
 
+	pi.on("input", async (event, ctx) => {
+		let state = reconstructPlanState(ctx);
+		if (!state?.active || state.phase === "aborted" || state.phase === "completed") return { action: "continue" as const };
+
+		// Extension follow-ups can be submitted after a phase transition but before the
+		// prompt builder has observed the narrowed tool surface. Re-apply the durable
+		// state at the earliest input hook so approval's execution kick starts with
+		// todo_write available instead of the stale planning surface.
+		const extensionFollowUp = event.source === "extension" || event.streamingBehavior === "followUp";
+		if (extensionFollowUp && state.phase === "awaiting_approval" && isExecutionKickForPlan(event.text, state)) {
+			const approved = await approvePlan(pi, ctx, state);
+			persistPlanState(pi, approved, "approval");
+			state = markExecutionKickSent(approved);
+			persistPlanState(pi, state, "phase_change");
+		}
+
+		applyActiveTools(pi, state);
+		updatePlanUi(ctx, state);
+		return { action: "continue" as const };
+	});
+
 	pi.on("tool_call", async (event, ctx) => {
 		const state = reconstructPlanState(ctx);
 		if (!state?.active || state.phase === "aborted") return;
@@ -1050,13 +1071,21 @@ function continueRevisionTurn(pi: ExtensionAPI, state: PlanFlowState, issueText:
 	);
 }
 
+function buildExecutionKickContent(state: PlanFlowState): string {
+	return `Plan approved. Begin execution now: call todo_write to mark the first step in_progress for list ${state.todoListId ?? `plan-${state.planId}`}.`;
+}
+
+function isExecutionKickForPlan(text: string, state: PlanFlowState): boolean {
+	return text.trim() === buildExecutionKickContent(state);
+}
+
 /** Start execution immediately after approval using the freshly narrowed execution tools. */
 function continueExecutionTurn(pi: ExtensionAPI, state: PlanFlowState) {
 	pi.sendMessage(
 		{
 			customType: PLAN_KICK_CUSTOM_TYPE,
 			display: false,
-			content: `Plan approved. Begin execution now: call todo_write to mark the first step in_progress for list ${state.todoListId}.`,
+			content: buildExecutionKickContent(state),
 		},
 		{ deliverAs: "followUp", triggerTurn: true },
 	);
