@@ -27,10 +27,13 @@ describe("plan-flow v2 integration guards", () => {
 		assert.match(source, /Trusted headless callers must pass approvalMode:'auto'/);
 	});
 
-	it("keeps plan state discoverable by yuki compaction reconstruction", () => {
+	it("keeps plan state discoverable across compaction", () => {
 		assert.match(compactionSource, /PLAN_STATE_CUSTOM_TYPE/);
 		assert.match(compactionSource, /entry\.customType === PLAN_STATE_CUSTOM_TYPE/);
 		assert.match(compactionSource, /readPlanState\(data\?\.state \?\? data\)/);
 		assert.match(compactionSource, /message\.role === "toolResult"/);
+		assert.match(source, /pi\.on\("session_before_compact"/);
+		assert.match(source, /pi\.on\("session_compact"/);
+		assert.match(source, /persistPlanState\(pi, state, "phase_change"\)/);
 	});
 });

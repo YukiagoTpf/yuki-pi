@@ -113,6 +113,7 @@ type PlanWriteInput = Static<typeof PlanWriteParams>;
 export default function planFlowExtension(pi: ExtensionAPI) {
 	// Guards against running two automatic reviews concurrently within one process.
 	let reviewInFlight = false;
+	let activePlanBeforeCompact: PlanFlowState | undefined;
 	// Counts consecutive phase-discipline tool blocks so repeated wrong-tool calls escalate to a
 	// shorter, stronger steer. Re-emitting the identical message on every rejected call read like a
 	// deadloop in the incident; an allowed call resets it. In-memory only, like the compile guard's
@@ -216,6 +217,20 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			applyActiveTools(pi, state);
 			updatePlanUi(ctx, state);
 		}
+	});
+
+	pi.on("session_before_compact", async (_event, ctx) => {
+		const state = reconstructPlanState(ctx);
+		activePlanBeforeCompact = state?.active && state.phase !== "aborted" && state.phase !== "completed" ? state : undefined;
+	});
+
+	pi.on("session_compact", async (_event, ctx) => {
+		if (!activePlanBeforeCompact) return;
+		const state = touch(activePlanBeforeCompact);
+		activePlanBeforeCompact = undefined;
+		persistPlanState(pi, state, "phase_change");
+		applyActiveTools(pi, state);
+		updatePlanUi(ctx, state);
 	});
 
 	pi.on("session_tree", async (_event, ctx) => {
