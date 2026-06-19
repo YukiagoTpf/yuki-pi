@@ -12,6 +12,7 @@ import { checkMandatoryValidation, getAllowedToolsForState as getAllowedToolsFor
 export { PLAN_STATE_CUSTOM_TYPE };
 
 const PLAN_TOOLS = new Set(["plan_write"]);
+const MAX_REVIEW_REVISION_ATTEMPTS = 3;
 /** customType for one-line, display:false plan-flow continuation messages. */
 const PLAN_KICK_CUSTOM_TYPE = "yuki-plan-flow-kick";
 const PLAN_MODE_PROMPT_CUSTOM_TYPE = "yuki-plan-flow-mode-prompt";
@@ -35,6 +36,12 @@ interface ReviewFeedback {
 	risks?: string[];
 	missingValidation?: string[];
 	raw?: string;
+}
+
+interface ReviewBlockingHistoryEntry {
+	attempt: number;
+	reviewedAt: string;
+	issues: ReviewFeedback["blockingIssues"];
 }
 
 export interface PlanningContext {
@@ -71,6 +78,8 @@ interface PlanFlowState {
 	reviewSkipped?: boolean;
 	reviewSkippedReason?: string;
 	reviewFeedback?: ReviewFeedback;
+	reviewRevisionAttempts: number;
+	reviewBlockingHistory: ReviewBlockingHistoryEntry[];
 	approved: boolean;
 	draftPath: string;
 	finalPath?: string;
@@ -466,6 +475,11 @@ async function runAutomaticReview(ctx: ExtensionContext, state: PlanFlowState): 
 			const raw = response.content.filter((block): block is { type: "text"; text: string } => block.type === "text").map((block) => block.text).join("\n");
 			const feedback = parseReviewFeedback(raw);
 			const hasBlocking = feedback.blockingIssues.length > 0;
+			const reviewRevisionAttempts = hasBlocking ? reviewing.reviewRevisionAttempts + 1 : reviewing.reviewRevisionAttempts;
+			const reviewBlockingHistory = hasBlocking ? [
+				...reviewing.reviewBlockingHistory,
+				{ attempt: reviewRevisionAttempts, reviewedAt: new Date().toISOString(), issues: feedback.blockingIssues },
+			] : reviewing.reviewBlockingHistory;
 			return touch({
 				...reviewing,
 				phase: hasBlocking ? "revising" : "awaiting_approval",
@@ -474,6 +488,8 @@ async function runAutomaticReview(ctx: ExtensionContext, state: PlanFlowState): 
 				reviewSkipped: false,
 				reviewSkippedReason: undefined,
 				reviewFeedback: feedback,
+				reviewRevisionAttempts,
+				reviewBlockingHistory,
 			});
 		} finally {
 			clearTimeout(timeout);
@@ -595,6 +611,7 @@ function applyPlanWrite(current: PlanFlowState, params: PlanWriteInput): PlanFlo
 		reviewPending: true,
 		reviewSkipped: false,
 		reviewSkippedReason: undefined,
+		reviewFeedback: undefined,
 	});
 }
 
@@ -713,14 +730,23 @@ async function runApprovalDialog(pi: ExtensionAPI, ctx: ExtensionContext, curren
 /** Drive post-review state changes from the turn_end handler.
  *
  * `state` has already been persisted/narrowed/UI-updated by the caller for the
- * reviewing->revising/awaiting_approval transition. Any follow-up model instruction is
- * queued for the next real prompt instead of triggered immediately, avoiding stale tool
- * snapshots that cannot see todo_write yet. */
+ * reviewing->revising/awaiting_approval transition. Blocking review feedback is an
+ * internal revision loop, not a user stop point: trigger an immediate follow-up turn so
+ * the agent explains the rejection and calls plan_write again without waiting for a new
+ * user prompt. Approval may synchronously transition to executing; execution kickoff is
+ * still queued for the next prompt so the model does not call todo_write from a stale
+ * tool snapshot. */
 async function drivePostReview(pi: ExtensionAPI, ctx: ExtensionContext, state: PlanFlowState): Promise<void> {
 	if (state.phase === "revising") {
 		const issueCount = state.reviewFeedback?.blockingIssues.length ?? 0;
-		if (ctx.hasUI) ctx.ui.notify(`Automatic review found ${issueCount} blocking issue(s); revising.`, "warning");
-		queueNextTurnInstruction(pi, `Address the automatic review feedback and call plan_write with the revised plan.\nBlocking issues:\n${formatReviewIssues(state)}`);
+		const issueText = formatReviewIssues(state);
+		if (state.reviewRevisionAttempts >= MAX_REVIEW_REVISION_ATTEMPTS) {
+			if (ctx.hasUI) ctx.ui.notify(`Automatic review still has ${issueCount} blocking issue(s) after ${state.reviewRevisionAttempts} attempt(s); waiting for intervention.`, "warning");
+			publishRevisionLoopStop(pi, state, issueText);
+			return;
+		}
+		if (ctx.hasUI) ctx.ui.notify(`Automatic review found ${issueCount} blocking issue(s); revising automatically (${state.reviewRevisionAttempts}/${MAX_REVIEW_REVISION_ATTEMPTS}).`, "warning");
+		continueRevisionTurn(pi, state, issueText);
 		return;
 	}
 
@@ -889,6 +915,51 @@ function triggerPlanTurn(pi: ExtensionAPI, content: string) {
 	);
 }
 
+/** Continue the automatic-review revision loop now, without waiting for user input. */
+function continueRevisionTurn(pi: ExtensionAPI, state: PlanFlowState, issueText: string) {
+	pi.sendMessage(
+		{
+			customType: PLAN_KICK_CUSTOM_TYPE,
+			display: false,
+			content: [
+				"Automatic review blocked the plan. This is an internal revision loop, not a user stop point.",
+				`Automatic review block ${state.reviewRevisionAttempts}/${MAX_REVIEW_REVISION_ATTEMPTS}; revise now. The internal loop stops at ${MAX_REVIEW_REVISION_ATTEMPTS} repeated block(s).`,
+				"First output a concise visible revision note to the user explaining: why the review rejected the plan, how you will revise it, and that you will immediately re-run plan_write.",
+				"Then call plan_write with the revised, decision-complete plan in this same turn.",
+				"Do not ask the user unless the blocking feedback exposes a genuine decision that cannot be resolved from repository facts or a low-risk assumption.",
+				"Blocking issues:",
+				issueText,
+			].join("\n"),
+		},
+		{ deliverAs: "followUp", triggerTurn: true },
+	);
+}
+
+/** Publish the exceptional stop after repeated automatic-review failures. */
+function publishRevisionLoopStop(pi: ExtensionAPI, state: PlanFlowState, issueText: string) {
+	const history = state.reviewBlockingHistory.length > 0 ? state.reviewBlockingHistory.map((entry) => {
+		const issues = entry.issues.map((issue, index) => `${index + 1}. ${issue.stepId ? `[${issue.stepId}] ` : ""}${issue.issue}${issue.suggestion ? ` Suggestion: ${issue.suggestion}` : ""}`).join("\n");
+		return `Attempt ${entry.attempt} at ${entry.reviewedAt}:\n${issues}`;
+	}).join("\n\n") : "(no blocking history recorded)";
+	pi.sendMessage(
+		{
+			customType: PLAN_KICK_CUSTOM_TYPE,
+			display: true,
+			content: [
+				`Automatic review is still blocking plan ${state.planId} after ${state.reviewRevisionAttempts} attempt(s), so yuki plan-flow stopped the internal revision loop to avoid spinning.`,
+				"Current blocking issues:",
+				issueText,
+				"",
+				"Blocking history:",
+				history,
+				"",
+				"You can inspect with /plan-debug, abort with /plan-abort, or give a concrete revision instruction.",
+			].join("\n"),
+		},
+		{ deliverAs: "followUp" },
+	);
+}
+
 /** Queue a hidden continuation instruction for the next real user/external prompt.
  *
  * This is the conservative yuki-pi-layer recovery for frozen tool snapshots: phase
@@ -973,6 +1044,8 @@ export async function startPlanFlow(pi: ExtensionAPI, ctx: ExtensionContext, opt
 		approvalMode,
 		reviewed: false,
 		reviewPending: false,
+		reviewRevisionAttempts: 0,
+		reviewBlockingHistory: [],
 		approved: false,
 		draftPath: "",
 		createdAt: now,
@@ -1104,6 +1177,8 @@ function normalizePlanState(state: PlanFlowState): PlanFlowState {
 		assumptions: state.assumptions ?? [],
 		risks: state.risks ?? [],
 		approvalMode: state.approvalMode ?? "ui",
+		reviewRevisionAttempts: state.reviewRevisionAttempts ?? 0,
+		reviewBlockingHistory: state.reviewBlockingHistory ?? [],
 		previousActiveTools: state.previousActiveTools ?? [],
 		currentActiveTools: state.currentActiveTools ?? [],
 		planningContext: state.planningContext ?? undefined,

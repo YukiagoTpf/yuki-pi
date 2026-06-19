@@ -5,6 +5,14 @@ import { readFileSync } from "node:fs";
 const source = readFileSync(new URL("../extensions/plan-flow/index.ts", import.meta.url), "utf8");
 const compactionSource = readFileSync(new URL("../extensions/yuki-compaction.ts", import.meta.url), "utf8");
 
+function extractDrivePostReviewRevisingBranch(): string {
+	const start = source.indexOf('if (state.phase === "revising") {', source.indexOf("async function drivePostReview"));
+	const end = source.indexOf("\n\t// phase === awaiting_approval", start);
+	assert.notEqual(start, -1);
+	assert.notEqual(end, -1);
+	return source.slice(start, end);
+}
+
 describe("plan-flow v2 integration guards", () => {
 	it("exposes only plan_write as the model-facing yuki planning tool", () => {
 		assert.match(source, /const PLAN_TOOLS = new Set\(\["plan_write"\]\)/);
@@ -35,5 +43,15 @@ describe("plan-flow v2 integration guards", () => {
 		assert.match(source, /pi\.on\("session_before_compact"/);
 		assert.match(source, /pi\.on\("session_compact"/);
 		assert.match(source, /persistPlanState\(pi, state, "phase_change"\)/);
+	});
+
+	it("continues automatic review revisions immediately instead of waiting for the next user turn", () => {
+		const revisingBranch = extractDrivePostReviewRevisingBranch();
+		assert.doesNotMatch(revisingBranch, /queueNextTurnInstruction/);
+		assert.match(revisingBranch, /continueRevisionTurn\(pi, state, issueText\)/);
+		assert.match(source, /function continueRevisionTurn[\s\S]*deliverAs: "followUp"[\s\S]*triggerTurn: true/);
+		assert.match(source, /First output a concise visible revision note to the user/);
+		assert.match(source, /MAX_REVIEW_REVISION_ATTEMPTS/);
+		assert.match(source, /function publishRevisionLoopStop/);
 	});
 });
