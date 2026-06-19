@@ -1,7 +1,7 @@
 import { complete } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { Markdown, Text, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { Markdown, Text, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -14,6 +14,7 @@ export { PLAN_STATE_CUSTOM_TYPE };
 const PLAN_TOOLS = new Set(["plan_write"]);
 const MAX_REVIEW_REVISION_ATTEMPTS = 3;
 const APPROVAL_MARKDOWN_BODY_LINES = 28;
+const APPROVAL_MOUSE_WHEEL_LINES = 4;
 /** customType for one-line, display:false plan-flow continuation messages. */
 const PLAN_KICK_CUSTOM_TYPE = "yuki-plan-flow-kick";
 const PLAN_MODE_PROMPT_CUSTOM_TYPE = "yuki-plan-flow-mode-prompt";
@@ -648,8 +649,28 @@ async function choosePlanApproval(ctx: ExtensionContext, current: PlanFlowState,
 			tui.requestRender();
 		}
 
+		function mouseWheelDelta(data: string): number | undefined {
+			const match = /\x1b\[<(\d+);\d+;\d+[mM]/.exec(data);
+			if (!match) return undefined;
+			const button = Number(match[1]);
+			if (button === 64 || button === 96) return -APPROVAL_MOUSE_WHEEL_LINES;
+			if (button === 65 || button === 97) return APPROVAL_MOUSE_WHEEL_LINES;
+			return undefined;
+		}
+
+		function ansiPad(line: string, width: number): string {
+			const clipped = truncateToWidth(line, Math.max(0, width), "");
+			return clipped + " ".repeat(Math.max(0, width - visibleWidth(clipped)));
+		}
+
+		function boxLine(content: string, innerWidth: number): string {
+			return `${theme.fg("muted", "│")} ${ansiPad(content, innerWidth)} ${theme.fg("muted", "│")}`;
+		}
+
 		return {
 			handleInput(data: string): void {
+				const wheel = mouseWheelDelta(data);
+				if (wheel !== undefined) return moveScroll(wheel, cachedWidth || 80);
 				if (matchesKey(data, "enter") || data === "a" || data === "A") return done("Approve");
 				if (data === "r" || data === "R") return done("Request revision");
 				if (matchesKey(data, "escape") || data === "q" || data === "Q") return done("Cancel");
@@ -672,21 +693,28 @@ async function choosePlanApproval(ctx: ExtensionContext, current: PlanFlowState,
 				cachedWidth = 0;
 			},
 			render(width: number): string[] {
-				const lines = getMarkdownLines(width);
+				const innerWidth = Math.max(20, width - 4);
+				const lines = getMarkdownLines(innerWidth);
 				const maxScroll = Math.max(0, lines.length - APPROVAL_MARKDOWN_BODY_LINES);
 				scroll = Math.max(0, Math.min(maxScroll, scroll));
 				const body = lines.slice(scroll, scroll + APPROVAL_MARKDOWN_BODY_LINES);
-				const controls = `${theme.fg("success", theme.bold("Enter/A"))} approve  ${theme.fg("warning", theme.bold("R"))} request revision  ${theme.fg("error", theme.bold("Esc/Q"))} cancel  ${theme.fg("muted", "↑↓/jk/Space scroll")}`;
+				const controls = `${theme.fg("success", theme.bold("Enter/A"))} approve  ${theme.fg("warning", theme.bold("R"))} revise  ${theme.fg("error", theme.bold("Esc/Q"))} cancel  ${theme.fg("muted", "Wheel/↑↓/jk/Space scroll")}`;
 				const position = maxScroll > 0 ? theme.fg("dim", `Showing ${scroll + 1}-${Math.min(scroll + APPROVAL_MARKDOWN_BODY_LINES, lines.length)} of ${lines.length}`) : theme.fg("dim", `${lines.length} lines`);
+				const titleLine = theme.bold(` ${title} `);
 				return [
-					truncateToWidth(theme.bold(title), width),
-					truncateToWidth(controls, width),
-					truncateToWidth(position, width),
-					"",
-					...body,
+					theme.fg("accent", `╭${"─".repeat(Math.max(0, width - 2))}╮`),
+					boxLine(titleLine, innerWidth),
+					boxLine(controls, innerWidth),
+					boxLine(position, innerWidth),
+					theme.fg("accent", `├${"─".repeat(Math.max(0, width - 2))}┤`),
+					...body.map((line) => boxLine(line, innerWidth)),
+					theme.fg("accent", `╰${"─".repeat(Math.max(0, width - 2))}╯`),
 				];
 			},
 		};
+	}, {
+		overlay: true,
+		overlayOptions: { anchor: "center", width: "92%", minWidth: 72, maxHeight: "88%", margin: 1 },
 	});
 }
 

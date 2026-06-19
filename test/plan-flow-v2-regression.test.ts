@@ -68,11 +68,15 @@ describe("plan-flow v2 integration guards", () => {
 
 	it("renders the full plan markdown inside the TUI approval surface", () => {
 		assert.match(source, /import \{ getMarkdownTheme, withFileMutationQueue \}/);
-		assert.match(source, /import \{ Markdown, Text, matchesKey, truncateToWidth \}/);
+		assert.match(source, /import \{ Markdown, Text, matchesKey, truncateToWidth, visibleWidth \}/);
 		assert.match(source, /async function choosePlanApproval/);
 		assert.match(source, /ctx\.ui\.custom<ApprovalChoice \| undefined>/);
 		assert.match(source, /const markdown = renderPlanMarkdown\(current\)/);
 		assert.match(source, /new Markdown\(markdown, 0, 0, mdTheme\)/);
+		assert.match(source, /overlay: true/);
+		assert.match(source, /overlayOptions: \{ anchor: "center"/);
+		assert.match(source, /function mouseWheelDelta/);
+		assert.match(source, /APPROVAL_MOUSE_WHEEL_LINES/);
 		assert.match(source, /Enter\/A/);
 		assert.match(source, /Request revision/);
 	});
