@@ -80,9 +80,11 @@ describe("plan-flow v2 integration guards", () => {
 		assert.doesNotMatch(source, /state\.steps\.map\(\(step, index\) => `\$\{index \+ 1\}\. \$\{step\.content\}`\)/);
 	});
 
-	it("prints the full plan markdown to history and keeps the TUI approval surface compact", () => {
+	it("prints the full plan markdown to history and uses an inline select for approval", () => {
 		assert.match(source, /import \{ getMarkdownTheme, withFileMutationQueue \}/);
-		assert.match(source, /import \{ Markdown, Text, matchesKey, truncateToWidth \}/);
+		assert.match(source, /import \{ Markdown, Text \}/);
+		assert.doesNotMatch(source, /matchesKey/);
+		assert.doesNotMatch(source, /truncateToWidth/);
 		assert.match(source, /PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE = "yuki-plan-flow-approval-preview"/);
 		assert.match(source, /registerMessageRenderer\(PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE/);
 		assert.match(source, /message\.customType === PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE/);
@@ -94,11 +96,13 @@ describe("plan-flow v2 integration guards", () => {
 		assert.match(source, /function renderApprovalPreviewMarkdown/);
 		assert.match(source, /renderPlanMarkdown\(state\)\.trim\(\)/);
 		assert.match(source, /publishApprovalPreview\(pi, current, message\)/);
-		assert.match(source, /ctx\.ui\.custom<ApprovalChoice \| undefined>/);
-		assert.match(source, /Full plan preview was printed above/);
-		assert.match(source, /overlayOptions: \{ anchor: "bottom-center"/);
-		assert.match(source, /Enter\/A/);
-		assert.match(source, /Request revision/);
+		// Approval must use the inline select (same mechanism as ask_user_question),
+		// never a floating overlay that obscures the history preview.
+		assert.match(source, /ctx\.ui\.select\(title, \["Approve", "Request revision", "Cancel"\]\)/);
+		assert.match(source, /full plan shown above/);
+		assert.doesNotMatch(source, /overlayOptions/);
+		assert.doesNotMatch(source, /anchor: "bottom-center"/);
+		assert.doesNotMatch(source, /ctx\.ui\.custom<ApprovalChoice/);
 		assert.doesNotMatch(source, /function mouseWheelDelta/);
 		assert.doesNotMatch(source, /APPROVAL_MOUSE_WHEEL_LINES/);
 	});

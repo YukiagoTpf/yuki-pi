@@ -1,7 +1,7 @@
 import { complete } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { Markdown, Text, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { Markdown, Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -668,31 +668,12 @@ function applyPlanWrite(current: PlanFlowState, params: PlanWriteInput): PlanFlo
 }
 
 async function choosePlanApproval(ctx: ExtensionContext, current: PlanFlowState, message?: string): Promise<ApprovalChoice | undefined> {
-	if (ctx.mode !== "tui") {
-		const choice = await ctx.ui.select(message ?? `Approve yuki plan '${current.title ?? current.planId}'?`, ["Approve", "Request revision", "Cancel"]);
-		return choice === "Approve" || choice === "Request revision" || choice === "Cancel" ? choice : undefined;
-	}
-
-	const title = message ?? `Approve yuki plan '${current.title ?? current.planId}'?`;
-	return await ctx.ui.custom<ApprovalChoice | undefined>((_tui, theme, _keybindings, done) => ({
-		handleInput(data: string): void {
-			if (matchesKey(data, "enter") || data === "a" || data === "A") return done("Approve");
-			if (data === "r" || data === "R") return done("Request revision");
-			if (matchesKey(data, "escape") || data === "q" || data === "Q") return done("Cancel");
-		},
-		invalidate(): void {},
-		render(width: number): string[] {
-			const controls = `${theme.fg("success", theme.bold("Enter/A"))} approve  ${theme.fg("warning", theme.bold("R"))} request revision  ${theme.fg("error", theme.bold("Esc/Q"))} cancel`;
-			return [
-				truncateToWidth(theme.bold(title), width),
-				truncateToWidth(theme.fg("muted", "Full plan preview was printed above. Use normal terminal scrollback to read it."), width),
-				truncateToWidth(controls, width),
-			];
-		},
-	}), {
-		overlay: true,
-		overlayOptions: { anchor: "bottom-center", width: "88%", minWidth: 64, maxHeight: 6, margin: 1 },
-	});
+	// Approval uses the same inline selector mechanism as ask_user_question: no
+	// floating overlay. The full plan markdown is published to the history stream by
+	// publishApprovalPreview() before this call, so it stays visible above the selector.
+	const title = message ?? `Approve yuki plan '${current.title ?? current.planId}'? (full plan shown above)`;
+	const choice = await ctx.ui.select(title, ["Approve", "Request revision", "Cancel"]);
+	return choice === "Approve" || choice === "Request revision" || choice === "Cancel" ? (choice as ApprovalChoice) : undefined;
 }
 
 function publishApprovalPreview(pi: ExtensionAPI, state: PlanFlowState, message?: string): void {
