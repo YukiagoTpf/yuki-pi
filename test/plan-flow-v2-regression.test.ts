@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 const source = readFileSync(new URL("../extensions/plan-flow/index.ts", import.meta.url), "utf8");
+const compactionSource = readFileSync(new URL("../extensions/yuki-compaction.ts", import.meta.url), "utf8");
 
 describe("plan-flow v2 integration guards", () => {
 	it("exposes only plan_write as the model-facing yuki planning tool", () => {
@@ -24,5 +25,12 @@ describe("plan-flow v2 integration guards", () => {
 		assert.match(source, /startPlanFlow\(pi, ctx, \{ request, planningContext, approvalMode: "ui" \}\)/);
 		assert.match(source, /state\.approvalMode === "auto"/);
 		assert.match(source, /Trusted headless callers must pass approvalMode:'auto'/);
+	});
+
+	it("keeps plan state discoverable by yuki compaction reconstruction", () => {
+		assert.match(compactionSource, /PLAN_STATE_CUSTOM_TYPE/);
+		assert.match(compactionSource, /entry\.customType === PLAN_STATE_CUSTOM_TYPE/);
+		assert.match(compactionSource, /readPlanState\(data\?\.state \?\? data\)/);
+		assert.match(compactionSource, /message\.role === "toolResult"/);
 	});
 });
