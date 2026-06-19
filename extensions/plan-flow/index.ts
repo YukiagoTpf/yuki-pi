@@ -87,6 +87,7 @@ interface PlanFlowState {
 	finalPath?: string;
 	approvedAt?: string;
 	todoListId?: string;
+	executionKickSent?: boolean;
 	createdAt: string;
 	updatedAt: string;
 	abortedAt?: string;
@@ -324,6 +325,7 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			approved: state.approved,
 			todoListId: state.todoListId,
 			allTodosPending,
+			executionKickSent: state.executionKickSent,
 			reviewIssuesText: formatReviewIssues(state),
 		});
 
@@ -719,7 +721,12 @@ async function approvePlan(pi: ExtensionAPI, ctx: ExtensionContext, current: Pla
 		finalPath,
 		todoListId,
 		reviewPending: false,
+		executionKickSent: false,
 	});
+}
+
+function markExecutionKickSent(state: PlanFlowState): PlanFlowState {
+	return touch({ ...state, executionKickSent: true });
 }
 
 async function abortPlan(pi: ExtensionAPI, ctx: ExtensionContext, state: PlanFlowState, reason: string): Promise<PlanFlowState> {
@@ -824,8 +831,12 @@ async function drivePostReview(pi: ExtensionAPI, ctx: ExtensionContext, state: P
 		persistPlanState(pi, approved, "approval");
 		applyActiveTools(pi, approved);
 		updatePlanUi(ctx, approved);
-		if (ctx.hasUI) ctx.ui.notify(`Plan auto-approved · ${approved.finalPath ?? ""}`, "info");
-		continueExecutionTurn(pi, approved);
+		const kicked = markExecutionKickSent(approved);
+		persistPlanState(pi, kicked, "phase_change");
+		applyActiveTools(pi, kicked);
+		updatePlanUi(ctx, kicked);
+		if (ctx.hasUI) ctx.ui.notify(`Plan auto-approved · ${kicked.finalPath ?? ""}`, "info");
+		continueExecutionTurn(pi, kicked);
 		return;
 	}
 
@@ -836,8 +847,12 @@ async function drivePostReview(pi: ExtensionAPI, ctx: ExtensionContext, state: P
 
 	const outcome = await runApprovalDialog(pi, ctx, state);
 	if (outcome.kind === "approved") {
-		ctx.ui.notify(`Plan approved · ${outcome.state.finalPath ?? ""}`, "info");
-		continueExecutionTurn(pi, outcome.state);
+		const kicked = markExecutionKickSent(outcome.state);
+		persistPlanState(pi, kicked, "phase_change");
+		applyActiveTools(pi, kicked);
+		updatePlanUi(ctx, kicked);
+		ctx.ui.notify(`Plan approved · ${kicked.finalPath ?? ""}`, "info");
+		continueExecutionTurn(pi, kicked);
 		return;
 	}
 	if (outcome.kind === "revising") {
@@ -1266,6 +1281,7 @@ function normalizePlanState(state: PlanFlowState): PlanFlowState {
 		previousActiveTools: state.previousActiveTools ?? [],
 		currentActiveTools: state.currentActiveTools ?? [],
 		planningContext: state.planningContext ?? undefined,
+		executionKickSent: state.executionKickSent ?? false,
 	};
 }
 

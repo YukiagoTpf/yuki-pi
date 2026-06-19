@@ -153,6 +153,10 @@ describe("getConvergenceKick", () => {
 		assert.equal(getConvergenceKick({ phase: "executing", todoListId: "plan-x", allTodosPending: false }), undefined);
 	});
 
+	it("does not repeat the executing kick after approval already sent one", () => {
+		assert.equal(getConvergenceKick({ phase: "executing", todoListId: "plan-x", allTodosPending: true, executionKickSent: true }), undefined);
+	});
+
 	it("does not kick executing without a todo list id", () => {
 		assert.equal(getConvergenceKick({ phase: "executing", allTodosPending: true }), undefined);
 	});

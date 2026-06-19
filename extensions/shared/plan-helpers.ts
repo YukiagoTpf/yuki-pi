@@ -172,6 +172,8 @@ export interface ConvergenceSignal {
 	approved?: boolean;
 	todoListId?: string;
 	allTodosPending?: boolean;
+	/** True once approval already sent the immediate execution-start follow-up. */
+	executionKickSent?: boolean;
 	/** Whether any grilling question is still unresolved (status "open"). Only
 	 * meaningful for the grilling phase; pass false/undefined otherwise. */
 	hasOpenQuestions?: boolean;
@@ -196,9 +198,10 @@ export function getConvergenceKick(signal: ConvergenceSignal): string | undefine
 		return undefined;
 	}
 	if (signal.phase === "executing") {
-		// Only nudge if NO todo has been touched yet. Once execution has started the model
-		// does legitimate multi-turn read/bash work and must NOT be re-hinted every turn.
-		if (!signal.todoListId || !signal.allTodosPending) return undefined;
+		// Only nudge if NO todo has been touched yet and approval did not already send
+		// the immediate execution-start follow-up. Once either happens, repeated turn-end
+		// warnings are noise rather than useful convergence.
+		if (!signal.todoListId || !signal.allTodosPending || signal.executionKickSent) return undefined;
 		return `yuki plan-flow: plan approved. Begin execution now: call todo_write to mark the first step in_progress for list ${signal.todoListId}.`;
 	}
 	return undefined;
