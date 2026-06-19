@@ -10,6 +10,3 @@ pnpm-debug.log*
 
 # Pi local/runtime state (agent context file, plan drafts)
 .pi/
-
-plan-smoke-test-*
-plan-*rendering*
