@@ -36,6 +36,13 @@ TARGET = Path.home() / (
 BACKUP = Path(__file__).parent / "originals" / "model-selector.js.bak"
 
 EDITS: list[tuple[str, str]] = [
+    # 0. import matchesKey from pi-tui
+    (
+        'import { modelsAreEqual } from "@earendil-works/pi-ai";\n'
+        'import { Container, fuzzyFilter, getKeybindings, Input, Spacer, Text, } from "@earendil-works/pi-tui";',
+        'import { modelsAreEqual } from "@earendil-works/pi-ai";\n'
+        'import { Container, fuzzyFilter, getKeybindings, Input, matchesKey, Spacer, Text, } from "@earendil-works/pi-tui";',
+    ),
     # 1. field declarations
     (
         '    scope = "all";\n    scopeText;\n    scopeHintText;',
@@ -160,9 +167,9 @@ EDITS: list[tuple[str, str]] = [
         "    handleInput(keyData) {\n"
         "        const kb = getKeybindings();\n"
         "        // rev.2026-06-19 provider-tabs patch: shift+left / shift+right switch provider (all scope only)\n"
-        '        if (keyData === "shift+left" || keyData === "shift+right") {\n'
+        '        if (matchesKey(keyData, "shift+left") || matchesKey(keyData, "shift+right")) {\n'
         '            if (this.scope === "all" && this.providers.length > 1) {\n'
-        '                this.setProvider(this.providerIndex + (keyData === "shift+left" ? -1 : 1));\n'
+        '                this.setProvider(this.providerIndex + (matchesKey(keyData, "shift+left") ? -1 : 1));\n'
         "            }\n"
         "            return;\n"
         "        }\n"
