@@ -69,18 +69,23 @@ describe("plan-flow v2 integration guards", () => {
 		assert.doesNotMatch(source, /state\.steps\.map\(\(step, index\) => `\$\{index \+ 1\}\. \$\{step\.content\}`\)/);
 	});
 
-	it("renders the full plan markdown inside the TUI approval surface", () => {
+	it("prints the full plan markdown to history and keeps the TUI approval surface compact", () => {
 		assert.match(source, /import \{ getMarkdownTheme, withFileMutationQueue \}/);
-		assert.match(source, /import \{ Markdown, Text, matchesKey, truncateToWidth, visibleWidth \}/);
-		assert.match(source, /async function choosePlanApproval/);
+		assert.match(source, /import \{ Markdown, Text, matchesKey, truncateToWidth \}/);
+		assert.match(source, /PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE = "yuki-plan-flow-approval-preview"/);
+		assert.match(source, /registerMessageRenderer\(PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE/);
+		assert.match(source, /message\.customType === PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE/);
+		assert.match(source, /function publishApprovalPreview/);
+		assert.match(source, /customType: PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE[\s\S]*display: true/);
+		assert.match(source, /function renderApprovalPreviewMarkdown/);
+		assert.match(source, /renderPlanMarkdown\(state\)\.trim\(\)/);
+		assert.match(source, /publishApprovalPreview\(pi, current, message\)/);
 		assert.match(source, /ctx\.ui\.custom<ApprovalChoice \| undefined>/);
-		assert.match(source, /const markdown = renderPlanMarkdown\(current\)/);
-		assert.match(source, /new Markdown\(markdown, 0, 0, mdTheme\)/);
-		assert.match(source, /overlay: true/);
-		assert.match(source, /overlayOptions: \{ anchor: "center"/);
-		assert.match(source, /function mouseWheelDelta/);
-		assert.match(source, /APPROVAL_MOUSE_WHEEL_LINES/);
+		assert.match(source, /Full plan preview was printed above/);
+		assert.match(source, /overlayOptions: \{ anchor: "bottom-center"/);
 		assert.match(source, /Enter\/A/);
 		assert.match(source, /Request revision/);
+		assert.doesNotMatch(source, /function mouseWheelDelta/);
+		assert.doesNotMatch(source, /APPROVAL_MOUSE_WHEEL_LINES/);
 	});
 });

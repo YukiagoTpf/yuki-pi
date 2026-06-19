@@ -1,7 +1,7 @@
 import { complete } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { Markdown, Text, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Markdown, Text, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -13,11 +13,10 @@ export { PLAN_STATE_CUSTOM_TYPE };
 
 const PLAN_TOOLS = new Set(["plan_write"]);
 const MAX_REVIEW_REVISION_ATTEMPTS = 3;
-const APPROVAL_MARKDOWN_BODY_LINES = 28;
-const APPROVAL_MOUSE_WHEEL_LINES = 4;
 /** customType for one-line, display:false plan-flow continuation messages. */
 const PLAN_KICK_CUSTOM_TYPE = "yuki-plan-flow-kick";
 const PLAN_MODE_PROMPT_CUSTOM_TYPE = "yuki-plan-flow-mode-prompt";
+const PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE = "yuki-plan-flow-approval-preview";
 
 type Phase = "idle" | "planning" | "reviewing" | "revising" | "awaiting_approval" | "executing" | "completed" | "aborted";
 type ApprovalMode = "ui" | "auto";
@@ -132,6 +131,8 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 	// deadloop in the incident; an allowed call resets it. In-memory only, like the compile guard's
 	// retry counters — a reload starts fresh, which is fine for a steering hint.
 	let consecutiveBlockedToolCalls = 0;
+
+	pi.registerMessageRenderer(PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE, (message) => new Markdown(String(message.content ?? ""), 0, 0, getMarkdownTheme()));
 
 	// Convergence guard for constrained execution only. Planning/revising are deliberately
 	// unconstrained: a turn with no tool may be a legitimate question to the user. Approval
@@ -258,9 +259,11 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("context", async (event, ctx) => {
+		const messages = event.messages.filter((message) => !(message.role === "custom" && (message.customType === PLAN_MODE_PROMPT_CUSTOM_TYPE || message.customType === PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE)));
 		const state = reconstructPlanState(ctx);
-		if (!state?.active || state.phase === "aborted" || state.phase === "completed") return;
-		const messages = event.messages.filter((message) => !(message.role === "custom" && message.customType === PLAN_MODE_PROMPT_CUSTOM_TYPE));
+		if (!state?.active || state.phase === "aborted" || state.phase === "completed") {
+			return messages.length === event.messages.length ? undefined : { messages };
+		}
 		messages.push({
 			role: "custom",
 			customType: PLAN_MODE_PROMPT_CUSTOM_TYPE,
@@ -647,96 +650,51 @@ async function choosePlanApproval(ctx: ExtensionContext, current: PlanFlowState,
 		return choice === "Approve" || choice === "Request revision" || choice === "Cancel" ? choice : undefined;
 	}
 
-	const markdown = renderPlanMarkdown(current);
 	const title = message ?? `Approve yuki plan '${current.title ?? current.planId}'?`;
-	return await ctx.ui.custom<ApprovalChoice | undefined>((tui, theme, _keybindings, done) => {
-		let scroll = 0;
-		let cachedWidth = 0;
-		let cachedLines: string[] = [];
-		const mdTheme = getMarkdownTheme();
-
-		function getMarkdownLines(width: number): string[] {
-			if (width !== cachedWidth) {
-				cachedWidth = width;
-				cachedLines = new Markdown(markdown, 0, 0, mdTheme).render(Math.max(20, width));
-			}
-			return cachedLines;
-		}
-
-		function moveScroll(delta: number, width: number) {
-			const lines = getMarkdownLines(width);
-			const maxScroll = Math.max(0, lines.length - APPROVAL_MARKDOWN_BODY_LINES);
-			scroll = Math.max(0, Math.min(maxScroll, scroll + delta));
-			tui.requestRender();
-		}
-
-		function mouseWheelDelta(data: string): number | undefined {
-			const match = /\x1b\[<(\d+);\d+;\d+[mM]/.exec(data);
-			if (!match) return undefined;
-			const button = Number(match[1]);
-			if (button === 64 || button === 96) return -APPROVAL_MOUSE_WHEEL_LINES;
-			if (button === 65 || button === 97) return APPROVAL_MOUSE_WHEEL_LINES;
-			return undefined;
-		}
-
-		function ansiPad(line: string, width: number): string {
-			const clipped = truncateToWidth(line, Math.max(0, width), "");
-			return clipped + " ".repeat(Math.max(0, width - visibleWidth(clipped)));
-		}
-
-		function boxLine(content: string, innerWidth: number): string {
-			return `${theme.fg("muted", "│")} ${ansiPad(content, innerWidth)} ${theme.fg("muted", "│")}`;
-		}
-
-		return {
-			handleInput(data: string): void {
-				const wheel = mouseWheelDelta(data);
-				if (wheel !== undefined) return moveScroll(wheel, cachedWidth || 80);
-				if (matchesKey(data, "enter") || data === "a" || data === "A") return done("Approve");
-				if (data === "r" || data === "R") return done("Request revision");
-				if (matchesKey(data, "escape") || data === "q" || data === "Q") return done("Cancel");
-				if (matchesKey(data, "down") || data === "j" || data === "J") return moveScroll(1, cachedWidth || 80);
-				if (matchesKey(data, "up") || data === "k" || data === "K") return moveScroll(-1, cachedWidth || 80);
-				if (data === " " || data === "f" || data === "F") return moveScroll(APPROVAL_MARKDOWN_BODY_LINES, cachedWidth || 80);
-				if (data === "b" || data === "B") return moveScroll(-APPROVAL_MARKDOWN_BODY_LINES, cachedWidth || 80);
-				if (matchesKey(data, "home") || data === "g") {
-					scroll = 0;
-					tui.requestRender();
-					return;
-				}
-				if (matchesKey(data, "end") || data === "G") {
-					const lines = getMarkdownLines(cachedWidth || 80);
-					scroll = Math.max(0, lines.length - APPROVAL_MARKDOWN_BODY_LINES);
-					tui.requestRender();
-				}
-			},
-			invalidate(): void {
-				cachedWidth = 0;
-			},
-			render(width: number): string[] {
-				const innerWidth = Math.max(20, width - 4);
-				const lines = getMarkdownLines(innerWidth);
-				const maxScroll = Math.max(0, lines.length - APPROVAL_MARKDOWN_BODY_LINES);
-				scroll = Math.max(0, Math.min(maxScroll, scroll));
-				const body = lines.slice(scroll, scroll + APPROVAL_MARKDOWN_BODY_LINES);
-				const controls = `${theme.fg("success", theme.bold("Enter/A"))} approve  ${theme.fg("warning", theme.bold("R"))} revise  ${theme.fg("error", theme.bold("Esc/Q"))} cancel  ${theme.fg("muted", "Wheel/↑↓/jk/Space scroll")}`;
-				const position = maxScroll > 0 ? theme.fg("dim", `Showing ${scroll + 1}-${Math.min(scroll + APPROVAL_MARKDOWN_BODY_LINES, lines.length)} of ${lines.length}`) : theme.fg("dim", `${lines.length} lines`);
-				const titleLine = theme.bold(` ${title} `);
-				return [
-					theme.fg("accent", `╭${"─".repeat(Math.max(0, width - 2))}╮`),
-					boxLine(titleLine, innerWidth),
-					boxLine(controls, innerWidth),
-					boxLine(position, innerWidth),
-					theme.fg("accent", `├${"─".repeat(Math.max(0, width - 2))}┤`),
-					...body.map((line) => boxLine(line, innerWidth)),
-					theme.fg("accent", `╰${"─".repeat(Math.max(0, width - 2))}╯`),
-				];
-			},
-		};
-	}, {
+	return await ctx.ui.custom<ApprovalChoice | undefined>((_tui, theme, _keybindings, done) => ({
+		handleInput(data: string): void {
+			if (matchesKey(data, "enter") || data === "a" || data === "A") return done("Approve");
+			if (data === "r" || data === "R") return done("Request revision");
+			if (matchesKey(data, "escape") || data === "q" || data === "Q") return done("Cancel");
+		},
+		invalidate(): void {},
+		render(width: number): string[] {
+			const controls = `${theme.fg("success", theme.bold("Enter/A"))} approve  ${theme.fg("warning", theme.bold("R"))} request revision  ${theme.fg("error", theme.bold("Esc/Q"))} cancel`;
+			return [
+				truncateToWidth(theme.bold(title), width),
+				truncateToWidth(theme.fg("muted", "Full plan preview was printed above. Use normal terminal scrollback to read it."), width),
+				truncateToWidth(controls, width),
+			];
+		},
+	}), {
 		overlay: true,
-		overlayOptions: { anchor: "center", width: "92%", minWidth: 72, maxHeight: "88%", margin: 1 },
+		overlayOptions: { anchor: "bottom-center", width: "88%", minWidth: 64, maxHeight: 6, margin: 1 },
 	});
+}
+
+function publishApprovalPreview(pi: ExtensionAPI, state: PlanFlowState, message?: string): void {
+	pi.sendMessage({
+		customType: PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE,
+		content: renderApprovalPreviewMarkdown(state, message),
+		display: true,
+		details: { planId: state.planId, phase: state.phase },
+	});
+}
+
+function renderApprovalPreviewMarkdown(state: PlanFlowState, message?: string): string {
+	const title = message ?? `Approve yuki plan '${state.title ?? state.planId}'?`;
+	return [
+		"---",
+		"## Yuki plan awaiting approval",
+		"",
+		`**${title}**`,
+		"",
+		"The approval controls are shown below. This preview is in the normal history stream, so use terminal scrollback to read it.",
+		"",
+		renderPlanMarkdown(state).trim(),
+		"",
+		"---",
+	].join("\n");
 }
 
 async function approvePlan(pi: ExtensionAPI, ctx: ExtensionContext, current: PlanFlowState): Promise<PlanFlowState> {
@@ -829,6 +787,7 @@ async function runApprovalDialog(pi: ExtensionAPI, ctx: ExtensionContext, curren
 	if (!ctx.hasUI) throw new Error("runApprovalDialog: interactive UI is required for approval.");
 	if (current.steps.length === 0) throw new Error("runApprovalDialog: current plan has no steps.");
 
+	publishApprovalPreview(pi, current, message);
 	const choice = await choosePlanApproval(ctx, current, message);
 
 	if (choice === "Cancel" || choice === undefined) {
