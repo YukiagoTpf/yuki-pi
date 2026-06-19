@@ -102,8 +102,8 @@ const PlanStepInputSchema = Type.Object({
 const PlanWriteParams = Type.Object({
 	title: Type.String(),
 	background: Type.String(),
-	decisions: Type.Optional(Type.Array(Type.String())),
-	assumptions: Type.Optional(Type.Array(Type.String())),
+	decisions: Type.Optional(Type.Array(Type.String({ description: "Resolved implementation decisions that remove ambiguity" }))),
+	assumptions: Type.Optional(Type.Array(Type.String({ description: "Explicit assumptions the implementation may rely on" }))),
 	steps: Type.Array(PlanStepInputSchema, { minItems: 1 }),
 	risks: Type.Optional(Type.Array(Type.String())),
 });
@@ -119,14 +119,9 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 	// retry counters — a reload starts fresh, which is fine for a steering hint.
 	let consecutiveBlockedToolCalls = 0;
 
-	// rev.4/rev.8 P0: convergence guard. B-class (tool-execute) transitions
-	// (grill_done -> drafting, plan_write -> awaiting_approval/revising, plan_exit ->
-	// executing) do NOT start a clean new turn, and setActiveTools does not narrow the
-	// current running loop's frozen tool snapshot. When the model ends such a turn without
-	// calling the expected next tool, queue a hidden instruction for the next real
-	// user/external prompt instead of steering the current loop. This avoids the whole
-	// wrong-tool chain (grill_plan -> plan_write -> plan_exit -> todo_write) retrying tools
-	// from an old snapshot.
+	// Convergence guard for constrained execution only. Planning/revising are deliberately
+	// unconstrained: a turn with no tool may be a legitimate question to the user. Approval
+	// and review are extension-owned, so they should not kick the model toward a tool.
 	//
 	// `convergenceKicks` counts consecutive no-progress continuation hints per plan id. A
 	// progress turn (reviewPending flipped, phase advanced, first todo touched) resets it.
@@ -260,14 +255,10 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 				reason: "yuki plan-flow: automatic review in progress; wait for the review result before calling plan_write again.",
 			};
 		}
-		// rev.7 P0: NEVER block plan tools. A blocked call returns createErrorToolResult with
-		// NO `terminate`, and shouldTerminateToolBatch is all-or-nothing, so a blocked plan
-		// tool never ends the turn — the model keeps retrying it on the frozen mid-turn tool
-		// surface (drafting/grilling wrong-tool loops). Instead, plan tools always execute and
-		// return terminate:true (with a decisive "call X instead" message on a wrong phase —
-		// see buildWrongPhaseResult). The clean-turn surface from setActiveTools is what
-		// actually narrows: in a clean turn a wrong plan tool is simply not offered, so the
-		// model cannot pick it. Letting plan tools run+terminate here is the hard constraint.
+		// NEVER block plan_write. A blocked call returns an error result with no
+		// `terminate`, so the model can keep retrying it on the frozen mid-turn tool
+		// surface. Let plan_write execute and return a terminating wrong-phase result
+		// instead; clean turns get the narrowed tool surface from setActiveTools.
 		if (PLAN_TOOLS.has(event.toolName)) {
 			consecutiveBlockedToolCalls = 0;
 			return;
@@ -283,10 +274,9 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 		consecutiveBlockedToolCalls = 0;
 	});
 
-	// rev.4 P0: convergence guard. Registered BEFORE the drafting-review turn_end
-	// handler so that on the plan_write turn_end we see drafting+reviewPending (a
-	// progress signal) and reset the counter instead of double-kicking alongside
-	// drivePostReview. See getConvergenceKick for the per-phase progress contract.
+	// Convergence guard. Registered BEFORE the review turn_end handler so that on the
+	// plan_write turn_end we see reviewing+reviewPending (a progress signal) and reset
+	// the counter instead of double-kicking alongside drivePostReview.
 	pi.on("turn_end", async (_event, ctx) => {
 		const state = reconstructPlanState(ctx);
 		if (!state) return;
@@ -490,6 +480,7 @@ function buildReviewPrompt(state: PlanFlowState): string {
 		"Return strict JSON only with this shape:",
 		'{"summary":"...","blockingIssues":[{"stepId":"step-1","issue":"...","suggestion":"..."}],"risks":["..."],"missingValidation":["step-2"]}',
 		"Only include blockingIssues for problems that would cause rework, unsafe changes, or an unexecutable plan.",
+		"Check specifically: unresolved implementation decisions, assumptions presented as facts, vague validation, missing mandatory validation, and steps too underspecified for another agent to execute.",
 		"If the plan is acceptable, return an empty blockingIssues array.",
 		"",
 		renderPlanMarkdown(state),
@@ -516,10 +507,7 @@ function parseReviewFeedback(raw: string): ReviewFeedback {
 	}
 }
 
-/** rev.3 P0-3: format review blocking issues for the revising kick content. The kick
- * is display:false (not in the visible transcript) but enters the LLM context, so the
- * model sees what to fix. The old buildReviewSteeringMessage carried this via a visible
- * sendUserMessage steer; that path is gone, so the issues ride the kick instead. */
+/** Format review blocking issues for revising prompts and hidden next-turn content. */
 function formatReviewIssues(state: PlanFlowState): string {
 	if (state.reviewSkipped) return `Automatic review was skipped: ${state.reviewSkippedReason ?? "unknown reason"}.`;
 	const issues = state.reviewFeedback?.blockingIssues;
@@ -673,13 +661,9 @@ type ApprovalOutcome =
 	| { kind: "revising"; state: PlanFlowState; revisionReason: string }
 	| { kind: "cancelled"; state: PlanFlowState };
 
-/** rev.3 P0-3: the shared approval dialog used by both the automatic (turn_end)
- * path and the plan_exit tool. Shows Approve / Request revision / Cancel, performs
- * the state transition (approvePlan / revising / abortPlan), persists, narrows tools,
- * and updates the UI. Returns the outcome; the caller decides how to drive the next
- * turn (A-class turn_end callers use kickTurn; B-class plan_exit returns a tool result).
- *
- * Requires ctx.hasUI — callers must branch on hasUI first. */
+/** Shared extension-owned approval dialog. Shows Approve / Request revision / Cancel,
+ * performs the state transition (approvePlan / revising / abortPlan), persists, narrows
+ * tools, and updates the UI. Requires ctx.hasUI — callers must branch on hasUI first. */
 async function runApprovalDialog(pi: ExtensionAPI, ctx: ExtensionContext, current: PlanFlowState, message?: string): Promise<ApprovalOutcome> {
 	if (!ctx.hasUI) throw new Error("runApprovalDialog: interactive UI is required for approval.");
 	if (current.steps.length === 0) throw new Error("runApprovalDialog: current plan has no steps.");
@@ -716,7 +700,7 @@ async function runApprovalDialog(pi: ExtensionAPI, ctx: ExtensionContext, curren
  * `state` has already been persisted/narrowed/UI-updated by the caller for the
  * reviewing->revising/awaiting_approval transition. Any follow-up model instruction is
  * queued for the next real prompt instead of triggered immediately, avoiding stale tool
- * snapshots that cannot see plan_write/plan_exit/todo_write yet. */
+ * snapshots that cannot see todo_write yet. */
 async function drivePostReview(pi: ExtensionAPI, ctx: ExtensionContext, state: PlanFlowState): Promise<void> {
 	if (state.phase === "revising") {
 		const issueCount = state.reviewFeedback?.blockingIssues.length ?? 0;
@@ -881,7 +865,7 @@ function updatePlanUi(ctx: ExtensionContext, state: PlanFlowState) {
  * Only use this from command/programmatic entry points that are not already inside the
  * agent loop. Do not use it from tool_result/turn_end driven phase transitions: Pi may
  * deliver triggerTurn messages as steering in the same frozen tool snapshot, so the
- * newly-enabled phase tool (plan_write/plan_exit/todo_write) may still be unavailable.
+ * newly-enabled execution tool (todo_write) may still be unavailable.
  */
 function triggerPlanTurn(pi: ExtensionAPI, content: string) {
 	pi.sendMessage(
@@ -906,7 +890,7 @@ function queueNextTurnInstruction(pi: ExtensionAPI, content: string) {
 /** Plan-flow entry phase helper.
  *
  * Persists the next state, narrows the active tool set, updates the UI, and starts the
- * first research turn. This is used by /plan/startPlanFlow, not by turn_end phase
+ * first planning turn. This is used by /plan/startPlanFlow, not by turn_end phase
  * convergence.
  */
 function advancePhase(pi: ExtensionAPI, ctx: ExtensionContext, next: PlanFlowState, kickContent: string, reason: PlanStateRecord["reason"] = "phase_change") {
@@ -925,7 +909,7 @@ function advancePhase(pi: ExtensionAPI, ctx: ExtensionContext, next: PlanFlowSta
  * prefill the editor with `/plan ...` via `setEditorText`, which forces the user to
  * press Enter a SECOND time (incident #1: "/ta-dev 回车后会先弄成 /plan 再回车才能发出去").
  * Callers that instead call this function skip the editor entirely and start the
- * research turn directly, so a single command submission is enough.
+ * planning turn directly, so a single command submission is enough.
  *
  * Accepts the same `ctx` shape as the `/plan` command handler (ExtensionCommandContext
  * extends ExtensionContext), and an optional pre-built `PlanningContext` so callers do
@@ -999,10 +983,9 @@ function buildKickoffContent(state: PlanFlowState): string {
 function buildBlockedToolReason(state: PlanFlowState, _toolName: string, allowed: string[], attempts: number): string {
 	// rev.4: calm on the first block, then escalate to a short, action-only message
 	// that names only the ALLOWED tool. The blocked tool name is intentionally never
-	// mentioned (naming it re-primes the model toward the very tool we are narrowing
-	// away — the root of the drafting plan_ask deadloop in the incident). The mid-turn
-	// block is a stopgap; the durable fix is state-sensitive tool narrowing plus queued
-	// next-turn instructions, so stale running-loop snapshots are not steered further.
+	// mentioned (naming it re-primes the model toward a disallowed tool). The mid-turn
+	// block is a stopgap; the durable fix is stable tool surfaces plus queued next-turn
+	// instructions, so stale running-loop snapshots are not steered further.
 	const allowedList = allowed.length > 0 ? allowed.join(", ") : "(automatic review is running)";
 	if (attempts >= 2) {
 		// Short, direct, action-only. Repeating the long calm line verbatim read like a
@@ -1021,23 +1004,12 @@ function nextActionHint(state: PlanFlowState): string {
 	return "Follow the yuki plan-flow phase prompt.";
 }
 
-/** rev.7 P0: a terminating "you called a plan tool in the wrong phase/state" result.
+/** A terminating "you called a plan tool in the wrong phase/state" result.
  *
- * Plan tools must NEVER throw on a phase mismatch and must NEVER be blocked by the
- * tool_call handler. Background (confirmed by reading pi runtime source): a blocked
- * tool call goes through the agent-loop `immediate` path and returns
- * `createErrorToolResult(reason)`, which has NO `terminate` field; `shouldTerminateToolBatch`
- * is all-or-nothing, so a blocked call never ends the turn. A thrown error is the same
- * (createErrorToolResult, no terminate). Either way the current turn's tool surface is
- * FROZEN (createContextSnapshot is taken once per runPromptMessages and never re-snapshotd
- * mid-turn), so the model keeps retrying the same disallowed plan tool against the frozen
- * surface — the drafting/grilling wrong-tool loops.
- *
- * Instead: plan tools always execute and return `terminate: true`. When called in the
- * wrong phase/state, they return this decisive "call X instead" result AND end the turn.
- * The active tool set is narrowed for the next real prompt; any continuation hint is
- * queued with deliverAs:"nextTurn" rather than steered into the current frozen snapshot.
- * This result makes the frozen-surface turn exit cleanly instead of loop-blocking. */
+ * plan_write must never throw on a phase mismatch and must never be blocked by the
+ * tool_call handler: blocked/thrown tool calls do not terminate the turn, so the model can
+ * retry against the frozen mid-turn tool snapshot. A terminating result exits cleanly; the
+ * active tool set is narrowed for the next real prompt. */
 function buildWrongPhaseResult(toolName: string, state: PlanFlowState, extra?: string): { content: Array<{ type: "text"; text: string }>; details: { state: PlanFlowState }; terminate: true } {
 	const hint = nextActionHint(state);
 	const text = extra
@@ -1165,8 +1137,8 @@ async function loadPlanningContext(ctx: ExtensionContext, token: string): Promis
 	return { context };
 }
 
-/** Render planning-context mandatory validation into the drafting phase prompt so the
- * model knows which sensors each step's `validation` must cover (plan_write enforces it). */
+/** Render planning-context mandatory validation into the planning prompt so the model
+ * knows which sensors each step's `validation` must cover (plan_write enforces it). */
 function renderPlanningContextGuidance(state: PlanFlowState): string {
 	const mandatory = state.planningContext?.mandatoryValidation?.filter(Boolean) ?? [];
 	if (mandatory.length === 0) return "";
