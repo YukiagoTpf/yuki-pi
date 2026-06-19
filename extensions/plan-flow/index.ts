@@ -1,7 +1,7 @@
 import { complete } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { getMarkdownTheme, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { Markdown, Text, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -13,12 +13,14 @@ export { PLAN_STATE_CUSTOM_TYPE };
 
 const PLAN_TOOLS = new Set(["plan_write"]);
 const MAX_REVIEW_REVISION_ATTEMPTS = 3;
+const APPROVAL_MARKDOWN_BODY_LINES = 28;
 /** customType for one-line, display:false plan-flow continuation messages. */
 const PLAN_KICK_CUSTOM_TYPE = "yuki-plan-flow-kick";
 const PLAN_MODE_PROMPT_CUSTOM_TYPE = "yuki-plan-flow-mode-prompt";
 
 type Phase = "idle" | "planning" | "reviewing" | "revising" | "awaiting_approval" | "executing" | "completed" | "aborted";
 type ApprovalMode = "ui" | "auto";
+type ApprovalChoice = "Approve" | "Request revision" | "Cancel";
 
 interface PlanStep {
 	id: string;
@@ -615,6 +617,77 @@ function applyPlanWrite(current: PlanFlowState, params: PlanWriteInput): PlanFlo
 	});
 }
 
+async function choosePlanApproval(ctx: ExtensionContext, current: PlanFlowState, message?: string): Promise<ApprovalChoice | undefined> {
+	if (ctx.mode !== "tui") {
+		const choice = await ctx.ui.select(message ?? `Approve yuki plan '${current.title ?? current.planId}'?`, ["Approve", "Request revision", "Cancel"]);
+		return choice === "Approve" || choice === "Request revision" || choice === "Cancel" ? choice : undefined;
+	}
+
+	const markdown = renderPlanMarkdown(current);
+	const title = message ?? `Approve yuki plan '${current.title ?? current.planId}'?`;
+	return await ctx.ui.custom<ApprovalChoice | undefined>((tui, theme, _keybindings, done) => {
+		let scroll = 0;
+		let cachedWidth = 0;
+		let cachedLines: string[] = [];
+		const mdTheme = getMarkdownTheme();
+
+		function getMarkdownLines(width: number): string[] {
+			if (width !== cachedWidth) {
+				cachedWidth = width;
+				cachedLines = new Markdown(markdown, 0, 0, mdTheme).render(Math.max(20, width));
+			}
+			return cachedLines;
+		}
+
+		function moveScroll(delta: number, width: number) {
+			const lines = getMarkdownLines(width);
+			const maxScroll = Math.max(0, lines.length - APPROVAL_MARKDOWN_BODY_LINES);
+			scroll = Math.max(0, Math.min(maxScroll, scroll + delta));
+			tui.requestRender();
+		}
+
+		return {
+			handleInput(data: string): void {
+				if (matchesKey(data, "enter") || data === "a" || data === "A") return done("Approve");
+				if (data === "r" || data === "R") return done("Request revision");
+				if (matchesKey(data, "escape") || data === "q" || data === "Q") return done("Cancel");
+				if (matchesKey(data, "down") || data === "j" || data === "J") return moveScroll(1, cachedWidth || 80);
+				if (matchesKey(data, "up") || data === "k" || data === "K") return moveScroll(-1, cachedWidth || 80);
+				if (data === " " || data === "f" || data === "F") return moveScroll(APPROVAL_MARKDOWN_BODY_LINES, cachedWidth || 80);
+				if (data === "b" || data === "B") return moveScroll(-APPROVAL_MARKDOWN_BODY_LINES, cachedWidth || 80);
+				if (matchesKey(data, "home") || data === "g") {
+					scroll = 0;
+					tui.requestRender();
+					return;
+				}
+				if (matchesKey(data, "end") || data === "G") {
+					const lines = getMarkdownLines(cachedWidth || 80);
+					scroll = Math.max(0, lines.length - APPROVAL_MARKDOWN_BODY_LINES);
+					tui.requestRender();
+				}
+			},
+			invalidate(): void {
+				cachedWidth = 0;
+			},
+			render(width: number): string[] {
+				const lines = getMarkdownLines(width);
+				const maxScroll = Math.max(0, lines.length - APPROVAL_MARKDOWN_BODY_LINES);
+				scroll = Math.max(0, Math.min(maxScroll, scroll));
+				const body = lines.slice(scroll, scroll + APPROVAL_MARKDOWN_BODY_LINES);
+				const controls = `${theme.fg("success", theme.bold("Enter/A"))} approve  ${theme.fg("warning", theme.bold("R"))} request revision  ${theme.fg("error", theme.bold("Esc/Q"))} cancel  ${theme.fg("muted", "↑↓/jk/Space scroll")}`;
+				const position = maxScroll > 0 ? theme.fg("dim", `Showing ${scroll + 1}-${Math.min(scroll + APPROVAL_MARKDOWN_BODY_LINES, lines.length)} of ${lines.length}`) : theme.fg("dim", `${lines.length} lines`);
+				return [
+					truncateToWidth(theme.bold(title), width),
+					truncateToWidth(controls, width),
+					truncateToWidth(position, width),
+					"",
+					...body,
+				];
+			},
+		};
+	});
+}
+
 async function approvePlan(pi: ExtensionAPI, ctx: ExtensionContext, current: PlanFlowState): Promise<PlanFlowState> {
 	const approvedAt = new Date().toISOString();
 	const todoListId = `plan-${current.planId}`;
@@ -700,11 +773,7 @@ async function runApprovalDialog(pi: ExtensionAPI, ctx: ExtensionContext, curren
 	if (!ctx.hasUI) throw new Error("runApprovalDialog: interactive UI is required for approval.");
 	if (current.steps.length === 0) throw new Error("runApprovalDialog: current plan has no steps.");
 
-	const choice = await ctx.ui.select(message ?? `Approve yuki plan '${current.title ?? current.planId}'?`, [
-		"Approve",
-		"Request revision",
-		"Cancel",
-	]);
+	const choice = await choosePlanApproval(ctx, current, message);
 
 	if (choice === "Cancel" || choice === undefined) {
 		const aborted = await abortPlan(pi, ctx, current, "cancelled during approval");
