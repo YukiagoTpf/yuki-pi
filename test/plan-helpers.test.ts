@@ -79,35 +79,19 @@ describe("parsePlanCommandArgs", () => {
 });
 
 describe("getAllowedToolsForState", () => {
-	const previous = ["read", "grep", "bash", "edit", "todo_read"];
+	const previous = ["read", "grep", "bash", "edit", "todo_read", "ask_user_question"];
 
-	it("allows only read-only previous tools plus grill_plan during research", () => {
-		assert.deepEqual(getAllowedToolsForState("research", previous), ["read", "grep", "grill_plan"]);
+	it("allows read/search, generic ask, and plan_write during planning", () => {
+		assert.deepEqual(getAllowedToolsForState("planning", previous), ["read", "grep", "ask_user_question", "plan_write"]);
 	});
 
-	it("allows grilling tools plus read-only previous tools during grilling with open questions", () => {
-		assert.deepEqual(getAllowedToolsForState("grilling", previous, { hasOpenGrillingQuestions: true }), ["read", "grep", "plan_ask", "grill_plan", "grill_done"]);
+	it("narrows revising to the same stable planning surface", () => {
+		assert.deepEqual(getAllowedToolsForState("revising", previous), ["read", "grep", "ask_user_question", "plan_write"]);
 	});
 
-	it("narrows grilling to exactly grill_done when there are no open questions", () => {
-		// rev.7: state-sensitive narrowing — without this the model keeps re-calling
-		// grill_plan after it already returned "no open questions" (grilling wrong-tool loop).
-		// The clean turn must offer ONLY grill_done (no read/grep, no grill_plan).
-		assert.deepEqual(getAllowedToolsForState("grilling", previous), ["grill_done"]);
-		assert.deepEqual(getAllowedToolsForState("grilling", previous, { hasOpenGrillingQuestions: false }), ["grill_done"]);
-	});
-
-	it("narrows drafting and revising to plan_write", () => {
-		assert.deepEqual(getAllowedToolsForState("drafting", previous), ["plan_write"]);
-		assert.deepEqual(getAllowedToolsForState("revising", previous), ["plan_write"]);
-	});
-
-	it("narrows awaiting approval to plan_write and plan_exit", () => {
-		assert.deepEqual(getAllowedToolsForState("awaiting_approval", previous), ["plan_write", "plan_exit"]);
-	});
-
-	it("allows no model tools while automatic review is running", () => {
+	it("allows no model tools while automatic review or approval is extension-owned", () => {
 		assert.deepEqual(getAllowedToolsForState("reviewing", previous), []);
+		assert.deepEqual(getAllowedToolsForState("awaiting_approval", previous), []);
 	});
 
 	it("restores previous tools plus todo tools while executing", () => {
@@ -152,35 +136,10 @@ describe("checkMandatoryValidation", () => {
 });
 
 describe("getConvergenceKick", () => {
-	it("kicks when drafting has no review pending and no review yet", () => {
-		assert.match(getConvergenceKick({ phase: "drafting", reviewPending: false, reviewed: false }) ?? "", /Call plan_write/);
-	});
-
-	it("does not kick drafting when a review is pending (review handler owns the next step)", () => {
-		assert.equal(getConvergenceKick({ phase: "drafting", reviewPending: true, reviewed: false }), undefined);
-	});
-
-	it("does not kick drafting when the review already ran (drivePostReview owns the next step)", () => {
-		assert.equal(getConvergenceKick({ phase: "drafting", reviewPending: false, reviewed: true }), undefined);
-	});
-
-	it("appends planning-context guidance to the drafting kick", () => {
-		const kick = getConvergenceKick({ phase: "drafting", planningContextGuidance: "\nMandatory validation: unity-csharp-compile." });
-		assert.match(kick ?? "", /Mandatory validation: unity-csharp-compile/);
-	});
-
-	it("kicks when still revising, embedding the review issues text", () => {
-		const kick = getConvergenceKick({ phase: "revising", reviewIssuesText: "1. [step-1] missing validation" });
-		assert.match(kick ?? "", /Call plan_write with the revised plan/);
-		assert.match(kick ?? "", /1\. \[step-1\] missing validation/);
-	});
-
-	it("kicks when awaiting approval and not yet approved", () => {
-		assert.match(getConvergenceKick({ phase: "awaiting_approval", approved: false }) ?? "", /call plan_exit/);
-	});
-
-	it("does not kick awaiting approval once approved", () => {
-		assert.equal(getConvergenceKick({ phase: "awaiting_approval", approved: true }), undefined);
+	it("does not kick planning, revising, reviewing, or awaiting approval", () => {
+		for (const phase of ["planning", "revising", "reviewing", "awaiting_approval"]) {
+			assert.equal(getConvergenceKick({ phase, reviewIssuesText: "blocking" }), undefined, `expected ${phase} to be extension/model-owned without kicks`);
+		}
 	});
 
 	it("kicks executing only when every todo is still pending", () => {
@@ -198,18 +157,10 @@ describe("getConvergenceKick", () => {
 		assert.equal(getConvergenceKick({ phase: "executing", allTodosPending: true }), undefined);
 	});
 
-	it("does not kick unconstrained phases (research, reviewing, idle, completed, aborted)", () => {
-		for (const phase of ["research", "reviewing", "idle", "completed", "aborted", "unknown"]) {
+	it("does not kick unconstrained terminal or unknown phases", () => {
+		for (const phase of ["idle", "completed", "aborted", "unknown"]) {
 			assert.equal(getConvergenceKick({ phase }), undefined, `expected ${phase} to be unconstrained`);
 		}
-	});
-
-	it("kicks grilling toward grill_done when there are no open questions", () => {
-		assert.match(getConvergenceKick({ phase: "grilling", hasOpenQuestions: false }) ?? "", /Call grill_done/);
-	});
-
-	it("does not kick grilling when there are still open questions", () => {
-		assert.equal(getConvergenceKick({ phase: "grilling", hasOpenQuestions: true }), undefined);
 	});
 });
 

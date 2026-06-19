@@ -1,4 +1,4 @@
-import { complete, StringEnum } from "@earendil-works/pi-ai";
+import { complete } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -7,16 +7,17 @@ import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { createTodoState, makeTodoStateRecord, reconstructTodoStates } from "../todo/index.ts";
 import { PLAN_STATE_CUSTOM_TYPE, TODO_STATE_CUSTOM_TYPE } from "../shared/constants.ts";
-import { checkMandatoryValidation, getAllowedToolsForState as getAllowedToolsForPhase, getConvergenceKick, isExecutableResolution, parsePlanCommandArgs, slugify } from "../shared/plan-helpers.ts";
+import { checkMandatoryValidation, getAllowedToolsForState as getAllowedToolsForPhase, getConvergenceKick, parsePlanCommandArgs, slugify } from "../shared/plan-helpers.ts";
 
 export { PLAN_STATE_CUSTOM_TYPE };
 
-const PLAN_TOOLS = new Set(["plan_ask", "grill_plan", "grill_done", "plan_write", "plan_exit"]);
-/** customType for the one-line, display:false kick messages that drive A-class
- * (turn_end) phase transitions. See advancePhase(). */
+const PLAN_TOOLS = new Set(["plan_write"]);
+/** customType for one-line, display:false plan-flow continuation messages. */
 const PLAN_KICK_CUSTOM_TYPE = "yuki-plan-flow-kick";
+const PLAN_MODE_PROMPT_CUSTOM_TYPE = "yuki-plan-flow-mode-prompt";
 
-type Phase = "idle" | "research" | "grilling" | "drafting" | "reviewing" | "revising" | "awaiting_approval" | "executing" | "completed" | "aborted";
+type Phase = "idle" | "planning" | "reviewing" | "revising" | "awaiting_approval" | "executing" | "completed" | "aborted";
+type ApprovalMode = "ui" | "auto";
 
 interface PlanStep {
 	id: string;
@@ -26,18 +27,6 @@ interface PlanStep {
 	files?: string[];
 	validation?: string[];
 	dependsOn?: string[];
-}
-
-interface OpenQuestion {
-	id: string;
-	topic: string;
-	question: string;
-	whyMatters: string;
-	status: "open" | "resolved";
-	resolution?: string;
-	answer?: string;
-	askedAt?: string;
-	answeredAt?: string;
 }
 
 interface ReviewFeedback {
@@ -71,12 +60,12 @@ interface PlanFlowState {
 	planningContext?: PlanningContext;
 	previousActiveTools: string[];
 	currentActiveTools: string[];
-	questions: OpenQuestion[];
-	askCount: number;
-	maxAskCount: number;
 	steps: PlanStep[];
 	background?: string;
+	decisions: string[];
+	assumptions: string[];
 	risks: string[];
+	approvalMode: ApprovalMode;
 	reviewed: boolean;
 	reviewPending: boolean;
 	reviewSkipped?: boolean;
@@ -113,53 +102,13 @@ const PlanStepInputSchema = Type.Object({
 const PlanWriteParams = Type.Object({
 	title: Type.String(),
 	background: Type.String(),
+	decisions: Type.Optional(Type.Array(Type.String())),
+	assumptions: Type.Optional(Type.Array(Type.String())),
 	steps: Type.Array(PlanStepInputSchema, { minItems: 1 }),
 	risks: Type.Optional(Type.Array(Type.String())),
 });
 
 type PlanWriteInput = Static<typeof PlanWriteParams>;
-
-const PlanExitParams = Type.Object({
-	message: Type.Optional(Type.String({ description: "Short message to show before approval" })),
-});
-
-type PlanExitInput = Static<typeof PlanExitParams>;
-
-const QuestionOptionSchema = Type.Object({
-	label: Type.String(),
-	description: Type.Optional(Type.String()),
-	value: Type.Optional(Type.String()),
-});
-
-const PlanAskParams = Type.Object({
-	topic: Type.String(),
-	question: Type.String(),
-	whyMatters: Type.String(),
-	options: Type.Optional(Type.Array(QuestionOptionSchema, { maxItems: 6 })),
-	allowOther: Type.Optional(Type.Boolean()),
-});
-
-type PlanAskInput = Static<typeof PlanAskParams>;
-
-const GrillPlanParams = Type.Object({
-	open_questions: Type.Array(
-		Type.Object({
-			topic: Type.String(),
-			question: Type.String(),
-			why_matters: Type.String(),
-			status: StringEnum(["open", "resolved"] as const),
-			resolution: Type.Optional(Type.String()),
-		}),
-		{ maxItems: 5 },
-	),
-	restart_research: Type.Optional(Type.Boolean()),
-});
-
-type GrillPlanInput = Static<typeof GrillPlanParams>;
-
-const GrillDoneParams = Type.Object({
-	summary: Type.String({ description: "Resolved decisions summary" }),
-});
 
 export default function planFlowExtension(pi: ExtensionAPI) {
 	// Guards against running two automatic reviews concurrently within one process.
@@ -170,20 +119,19 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 	// retry counters — a reload starts fresh, which is fine for a steering hint.
 	let consecutiveBlockedToolCalls = 0;
 
-	// rev.4 P0: convergence guard. B-class (tool-execute) transitions (grill_done ->
-	// drafting, plan_write -> awaiting_approval/revising, plan_exit -> executing) do NOT
-	// start a clean new turn, and setActiveTools does not narrow the current (streaming)
-	// turn's tool set. When the model ends such a turn without calling the expected next
-	// tool, the flow used to stall until the user typed "继续" (incident #3), and the stale
-	// mid-turn tool set still exposed disallowed tools like plan_ask so the model kept
-	// retrying them (incident #2). The convergence turn_end handler below detects these
-	// no-progress turns and re-kicks a clean, narrowed turn (A-class) so the disallowed
-	// tool is no longer presented to the model and the flow auto-continues.
+	// rev.4/rev.8 P0: convergence guard. B-class (tool-execute) transitions
+	// (grill_done -> drafting, plan_write -> awaiting_approval/revising, plan_exit ->
+	// executing) do NOT start a clean new turn, and setActiveTools does not narrow the
+	// current running loop's frozen tool snapshot. When the model ends such a turn without
+	// calling the expected next tool, queue a hidden instruction for the next real
+	// user/external prompt instead of steering the current loop. This avoids the whole
+	// wrong-tool chain (grill_plan -> plan_write -> plan_exit -> todo_write) retrying tools
+	// from an old snapshot.
 	//
-	// `convergenceKicks` counts consecutive no-progress re-kicks per plan id. A progress
-	// turn (reviewPending flipped, phase advanced, first todo touched) resets it. After
-	// MAX_CONVERGENCE_KICKS we stop auto-kicking and surface a visible notify so the user
-	// can /plan-abort or continue manually, avoiding an infinite kick loop.
+	// `convergenceKicks` counts consecutive no-progress continuation hints per plan id. A
+	// progress turn (reviewPending flipped, phase advanced, first todo touched) resets it.
+	// After MAX_CONVERGENCE_KICKS we surface a visible notify so the user can /plan-abort
+	// or continue manually, avoiding an infinite hint loop.
 	const convergenceKicks = new Map<string, number>();
 	const MAX_CONVERGENCE_KICKS = 3;
 
@@ -214,7 +162,7 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			}
 
 			const request = parsed.request;
-			await startPlanFlow(pi, ctx, { request, planningContext });
+			await startPlanFlow(pi, ctx, { request, planningContext, approvalMode: "ui" });
 		},
 	});
 
@@ -286,10 +234,18 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("before_agent_start", async (event, ctx) => {
+	pi.on("context", async (event, ctx) => {
 		const state = reconstructPlanState(ctx);
-		if (!state?.active || state.phase === "aborted") return;
-		return { systemPrompt: `${event.systemPrompt}\n\n${buildPhasePrompt(state)}` };
+		if (!state?.active || state.phase === "aborted" || state.phase === "completed") return;
+		const messages = event.messages.filter((message) => !(message.role === "custom" && message.customType === PLAN_MODE_PROMPT_CUSTOM_TYPE));
+		messages.push({
+			role: "custom",
+			customType: PLAN_MODE_PROMPT_CUSTOM_TYPE,
+			content: buildPhasePrompt(state),
+			display: false,
+			timestamp: Date.now(),
+		});
+		return { messages };
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
@@ -345,8 +301,6 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			const todos = reconstructTodoStates(ctx).get(state.todoListId)?.todos ?? [];
 			allTodosPending = todos.length > 0 && todos.every((todo) => todo.status === "pending");
 		}
-		const hasOpenQuestions = state.questions.some((question) => question.status === "open");
-
 		const kick = getConvergenceKick({
 			phase: state.phase,
 			reviewPending: state.reviewPending,
@@ -354,8 +308,6 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			approved: state.approved,
 			todoListId: state.todoListId,
 			allTodosPending,
-			hasOpenQuestions,
-			planningContextGuidance: renderPlanningContextGuidance(state),
 			reviewIssuesText: formatReviewIssues(state),
 		});
 
@@ -365,38 +317,30 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		// rev.5 P0: re-narrow the active tool set before kicking so the new turn's tool
-		// surface matches the convergence target (e.g. grilling with no open questions ->
-		// grill_done only). Without this the kick could start a turn that still exposes the
-		// tool the model kept mis-calling (grilling wrong-tool loop). setActiveToolsByName
-		// persists into agent.state.tools, which the new turn's createContextSnapshot reads.
+		// Re-narrow the active tool set for the next real prompt. Do not trigger an
+		// immediate steering continuation here: turn_end can still be inside the same
+		// running agent loop, whose tool snapshot may not contain the phase's next tool.
 		applyActiveTools(pi, state);
 
 		const count = (convergenceKicks.get(state.planId) ?? 0) + 1;
 		if (count > MAX_CONVERGENCE_KICKS) {
-			// Stop auto-kicking to avoid an infinite loop; surface the stall to the user.
 			ctx.ui.notify(
-				`yuki plan-flow: stalled in ${state.phase} after ${MAX_CONVERGENCE_KICKS} auto-continues. Use /plan-debug, /plan-abort, or tell me to continue.`,
+				`yuki plan-flow: stalled in ${state.phase} after ${MAX_CONVERGENCE_KICKS} continuation hints. Use /plan-debug, /plan-abort, or tell me to continue.`,
 				"warning",
 			);
 			return;
 		}
 		convergenceKicks.set(state.planId, count);
-		// A-class: turn has ended (!isStreaming), so kickTurn starts a clean, narrowed
-		// turn. The narrowed tool set (e.g. plan_write only in drafting) takes effect on
-		// this new turn, so the disallowed tool the model kept retrying is no longer
-		// presented. This is the real fix for incident #2 (drafting plan_ask loop) and
-		// #3 (flow stops until the user types "继续").
-		kickTurn(pi, kick);
+		queueNextTurnInstruction(pi, kick);
 	});
 
 	pi.on("turn_end", async (_event, ctx) => {
 		const state = reconstructPlanState(ctx);
 		// Fire whenever a draft is awaiting its automatic review, not just on the
 		// turn that produced the plan_write. If a prior review was interrupted
-		// (crash/restart), the durable state is still drafting+reviewPending, and
+		// (crash/restart), the durable state is still reviewing+reviewPending, and
 		// the next turn_end re-triggers it instead of getting stuck until abort.
-		if (!state?.active || state.phase !== "drafting" || !state.reviewPending || state.reviewed) return;
+		if (!state?.active || state.phase !== "reviewing" || !state.reviewPending || state.reviewed) return;
 		if (reviewInFlight) return;
 
 		reviewInFlight = true;
@@ -405,10 +349,8 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			persistPlanState(pi, reviewed, reviewed.reviewSkipped ? "review_skipped" : "review_complete");
 			applyActiveTools(pi, reviewed);
 			updatePlanUi(ctx, reviewed);
-			// rev.3 P0-3/P0-4: drive approval directly from here. The turn has ended
-			// (!isStreaming), so this is an A-class transition point and kickTurn's
-			// triggerTurn actually starts a clean, narrowed next turn. The old
-			// sendUserMessage(steer) that produced visible noise is gone.
+			// Drive post-review state changes, but queue any model continuation for the
+			// next real prompt so it sees the narrowed tool surface.
 			await drivePostReview(pi, ctx, reviewed);
 		} finally {
 			reviewInFlight = false;
@@ -432,164 +374,39 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "grill_plan",
-		label: "Grill Plan",
-		description: "Record critical planning questions after research. Use before drafting to decide whether to ask the user or proceed.",
-		promptSnippet: "Record critical yuki plan-flow questions before drafting.",
-		promptGuidelines: [
-			"Use grill_plan after read-only research to identify only decisions that can change implementation architecture or cause rework.",
-			"Do not ask facts you can inspect from the repository; ask at most five critical questions total.",
-		],
-		parameters: GrillPlanParams,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const current = reconstructPlanState(ctx);
-			if (!current?.active || current.phase === "aborted") throw new Error("grill_plan: no active yuki plan.");
-			// rev.7: wrong-phase returns a terminating "call X instead" result instead of
-			// throwing. A throw -> createErrorToolResult has no `terminate`, so the frozen
-			// mid-turn surface would let the model retry grill_plan forever (wrong-tool loop).
-			if (!["research", "grilling"].includes(current.phase)) {
-				return buildWrongPhaseResult("grill_plan", current);
-			}
-			const next = applyGrillPlan(current, params);
-			applyActiveTools(pi, next);
-			updatePlanUi(ctx, next);
-			// rev.5 P0: terminate the turn after grill_plan so the convergence guard can
-			// re-kick a clean, state-narrowed grilling turn. When grill_plan records no open
-			// questions, applyActiveTools above narrows the NEXT turn's tool surface to
-			// grill_done only (state-sensitive narrowing in getAllowedToolsForState). But the
-			// CURRENT turn's tool surface is frozen (see grill_done terminate note), so if we
-			// let the turn continue the model could re-call grill_plan — the grilling wrong-tool
-			// loop. terminate:true forces turn_end, where the convergence guard kicks a clean
-			// turn exposing only grill_done (no open questions) or grill_plan/plan_ask/grill_done
-			// (open questions remain). Same hard-constraint pattern as grill_done / plan_write.
-			return {
-				content: [{ type: "text" as const, text: buildGrillPlanResult(next) }],
-				details: { state: next },
-				terminate: true,
-			};
-		},
-	});
-
-	pi.registerTool({
-		name: "plan_ask",
-		label: "Plan Ask",
-		description: "Ask the user one critical yuki plan-flow question and record the answer.",
-		promptSnippet: "Ask one critical yuki plan-flow question during grilling.",
-		promptGuidelines: [
-			"Use plan_ask only for critical decisions that cannot be answered from code inspection.",
-			"Do not exceed five total plan_ask calls in one yuki plan-flow.",
-		],
-		parameters: PlanAskParams,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const current = reconstructPlanState(ctx);
-			if (!current?.active || current.phase === "aborted") throw new Error("plan_ask: no active yuki plan.");
-			// rev.7: each guard below returns a terminating result instead of throwing.
-			// A throw -> createErrorToolResult has no `terminate`, so the frozen mid-turn
-			// surface would let the model retry plan_ask forever (wrong-tool loop). The
-			// terminating result ends the turn; the convergence guard then kicks a clean,
-			// narrowed turn exposing only the correct tool.
-			if (current.phase !== "grilling") {
-				return buildWrongPhaseResult("plan_ask", current);
-			}
-			if (current.askCount >= current.maxAskCount) {
-				return buildWrongPhaseResult("plan_ask", current, `question limit ${current.maxAskCount} reached`);
-			}
-			if (!ctx.hasUI) {
-				return buildWrongPhaseResult("plan_ask", current, "no interactive UI available");
-			}
-
-			const answer = await askPlanQuestion(ctx, params);
-			if (!answer) {
-				// User dismissed the input. Terminate so the flow does not stall; the
-				// convergence guard will re-kick grilling (or the user can /plan-abort).
-				return buildWrongPhaseResult("plan_ask", current, "user did not answer");
-			}
-			const next = recordPlanAnswer(current, params, answer);
-			updatePlanUi(ctx, next);
-			// NOTE: plan_ask does NOT terminate on a successful ask. Unlike grill_plan /
-			// grill_done / plan_write, a successful plan_ask leaves the flow in grilling
-			// (possibly with more open questions), and the grilling tool surface is already
-			// all-valid (plan_ask / grill_plan / grill_done + read-only), so there is no
-			// wrong-tool loop to break. Terminating here would stall the flow between
-			// questions: the convergence guard only kicks grilling when there are NO open
-			// questions, so after a single ask with remaining open questions the turn would
-			// end with no kick and the user would have to type "继续" (incident #3 regression).
-			// Let the model keep asking or call grill_done within this turn.
-			return {
-				content: [{ type: "text" as const, text: `User answered '${params.topic}': ${answer}` }],
-				details: { state: next, answer },
-			};
-		},
-	});
-
-	pi.registerTool({
-		name: "grill_done",
-		label: "Grill Done",
-		description: "Finish yuki plan-flow grilling and move to drafting.",
-		promptSnippet: "Finish yuki plan-flow grilling and proceed to plan_write.",
-		parameters: GrillDoneParams,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const current = reconstructPlanState(ctx);
-			if (!current?.active || current.phase === "aborted") throw new Error("grill_done: no active yuki plan.");
-			// rev.7: wrong-phase returns a terminating result instead of throwing (a throw
-			// has no `terminate` -> frozen-surface retry loop). See buildWrongPhaseResult.
-			if (!["research", "grilling"].includes(current.phase)) {
-				return buildWrongPhaseResult("grill_done", current);
-			}
-			const next = touch({ ...current, phase: "drafting" });
-			applyActiveTools(pi, next);
-			updatePlanUi(ctx, next);
-			// rev.4 P0 hard constraint: return terminate:true so the agent loop ends this
-			// turn immediately after grill_done. This is the real fix for the drafting
-			// plan_ask loop (incident #2). Background: grill_done is a B-class (tool-execute)
-			// transition into drafting, but the current turn's tool surface is FROZEN at the
-			// grilling set (createContextSnapshot is taken once per runPromptMessages; the
-			// Agent class does not re-snapshot tools mid-turn and exposes no prepareNextTurn
-			// that re-narrows). So if the turn kept going, the model would still see plan_ask
-			// (but NOT plan_write) and would retry plan_ask against the tool_call block — the
-			// observed deadloop. By terminating the turn here, control reaches turn_end, where
-			// the convergence guard kicks a CLEAN A-class drafting turn whose tool surface is
-			// only plan_write (applyActiveTools above set state.tools=[plan_write], which the
-			// new turn's createContextSnapshot picks up). The model then cannot call plan_ask
-			// at all and calls plan_write. terminate requires every result in the batch to set
-			// it; grill_done is normally called alone, so this is safe.
-			return {
-				content: [{ type: "text" as const, text: `Phase is now drafting. Grilling summary: ${params.summary}. Ending turn; the next turn will expose only plan_write — call plan_write with the structured plan.` }],
-				details: { state: next, summary: params.summary },
-				terminate: true,
-			};
-		},
-	});
-
-	pi.registerTool({
 		name: "plan_write",
 		label: "Plan Write",
 		description: "Write or revise the current yuki plan as structured steps. This writes branch-safe plan state and renders a draft file.",
-		promptSnippet: "Write the yuki plan draft with structured steps before asking for approval.",
+		promptSnippet: "Write or revise the yuki plan draft with structured steps, decisions, and assumptions.",
 		promptGuidelines: [
-			"Use plan_write after read-only research when a yuki plan-flow is active.",
+			"Use plan_write only after read-only planning when a yuki plan-flow is active.",
 			"plan_write is the source of truth for plan steps; do not create free-form plan markdown instead.",
 			"Each plan_write step must include content and activeForm, and should include validation when possible.",
+			"Include decisions and assumptions explicitly so the implementation has no unresolved branches.",
 		],
 		parameters: PlanWriteParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const current = reconstructPlanState(ctx);
 			if (!current?.active || current.phase === "aborted") throw new Error("plan_write: no active yuki plan. Start with /plan <request>.");
-			// rev.7: wrong-phase returns a terminating result instead of throwing (a throw
-			// has no `terminate` -> frozen-surface retry loop). See buildWrongPhaseResult.
-			if (!["drafting", "revising", "awaiting_approval"].includes(current.phase)) {
+			if (!["planning", "revising"].includes(current.phase)) {
 				return buildWrongPhaseResult("plan_write", current);
 			}
 
-			const next = applyPlanWrite(current, params);
+			let next: PlanFlowState;
+			try {
+				next = applyPlanWrite(current, params);
+			} catch (error) {
+				return {
+					content: [{ type: "text" as const, text: (error as Error).message }],
+					details: { state: current },
+				};
+			}
 			await renderDraft(ctx, next);
 			applyActiveTools(pi, next);
 			updatePlanUi(ctx, next);
 
-			// rev.4 P0: terminate the turn after plan_write so the automatic review
-			// (drafting) / approval drive (revising) runs at turn_end immediately, and the
-			// model cannot re-call plan_write or stray tools in a stale frozen tool surface.
-			// Same hard constraint as grill_done: see AgentToolResult.terminate.
+			// Terminate the turn after a successful plan_write so automatic review runs
+			// at turn_end and the next turn sees a fresh, narrowed tool snapshot.
 			return {
 				content: [{ type: "text" as const, text: buildPlanWriteResult(next) }],
 				details: { state: next },
@@ -607,163 +424,11 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			return new Text(theme.fg("success", "✓ plan draft ready ") + theme.fg("muted", `${state.steps.length} step(s), phase=${state.phase}`), 0, 0);
 		},
 	});
-
-	pi.registerTool({
-		name: "plan_exit",
-		label: "Plan Exit",
-		description: "Submit the current yuki plan for user approval. Approval promotes the plan and seeds a plan-owned todo list.",
-		promptSnippet: "Submit the yuki plan for user approval before implementation.",
-		promptGuidelines: [
-			"Use plan_exit only after plan_write has produced the plan the user should approve.",
-			"Do not start implementation before plan_exit returns approval and the plan enters executing phase.",
-		],
-		parameters: PlanExitParams,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const current = reconstructPlanState(ctx);
-			if (!current?.active || current.phase === "aborted") throw new Error("plan_exit: no active yuki plan.");
-			// rev.7: wrong-phase / no-steps return terminating results instead of throwing
-			// (a throw has no `terminate` -> frozen-surface retry loop). See buildWrongPhaseResult.
-			if (current.phase !== "awaiting_approval") {
-				return buildWrongPhaseResult("plan_exit", current);
-			}
-			if (current.steps.length === 0) {
-				return buildWrongPhaseResult("plan_exit", current, "plan has no steps");
-			}
-
-			// rev.3 P0-3/P0-4: plan_exit runs inside a tool execute() (streaming), so it is
-			// a B-class transition point — triggerTurn would degrade to a steer here. We do
-			// NOT kick a new turn; instead the decisive tool-result text guides the model to
-			// converge (approve -> todo_write, revising -> plan_write) within this turn. The
-			// narrowed tool set takes effect on the next turn.
-			if (!ctx.hasUI) {
-				// Headless/programmatic (E2E, cron): no dialog available. Auto-approve so
-			// plan-flow can proceed — running /plan in a headless context already implies
-			// intent to execute. Interactive confirmation is the hasUI path below.
-				const approved = await approvePlan(pi, ctx, current);
-				persistPlanState(pi, approved, "approval");
-				applyActiveTools(pi, approved);
-				updatePlanUi(ctx, approved);
-				return {
-					content: [{ type: "text" as const, text: `Plan auto-approved (headless) and saved to ${approved.finalPath}. A plan-owned todo list '${approved.todoListId}' was created. Begin execution with todo_write on the first step.` }],
-					details: { state: approved },
-					terminate: true,
-				};
-			}
-
-			const outcome = await runApprovalDialog(pi, ctx, current, params.message);
-			if (outcome.kind === "cancelled") {
-				return { content: [{ type: "text" as const, text: "Plan cancelled by user." }], details: { state: outcome.state }, terminate: true };
-			}
-			if (outcome.kind === "revising") {
-				return {
-					content: [{ type: "text" as const, text: `User requested revision: ${outcome.revisionReason}\nCall plan_write with the revised plan.` }],
-					details: { state: outcome.state, revisionReason: outcome.revisionReason },
-					terminate: true,
-				};
-			}
-			// approved (B-class): decisive result guides the model to start todo_write.
-			// rev.7: terminate so the executing turn starts clean and narrowed (todo tools),
-			// instead of the model continuing on the frozen awaiting_approval surface.
-			return {
-				content: [{ type: "text" as const, text: `Plan approved and saved to ${outcome.state.finalPath}. A plan-owned todo list '${outcome.state.todoListId}' was created. Begin execution with todo_write on the first step.` }],
-				details: { state: outcome.state },
-				terminate: true,
-			};
-		},
-		renderCall(_args, theme) {
-			return new Text(theme.fg("toolTitle", theme.bold("plan_exit ")) + theme.fg("muted", "request approval"), 0, 0);
-		},
-		renderResult(result, _options, theme) {
-			const state = (result.details as { state?: PlanFlowState } | undefined)?.state;
-			if (!state) return new Text(textContent(result), 0, 0);
-			if (state.phase === "executing") return new Text(theme.fg("success", `✓ approved ${state.finalPath ?? ""}`), 0, 0);
-			if (state.phase === "revising") return new Text(theme.fg("warning", "Revision requested"), 0, 0);
-			if (state.phase === "aborted") return new Text(theme.fg("warning", "Plan cancelled"), 0, 0);
-			return new Text(theme.fg("muted", `phase=${state.phase}`), 0, 0);
-		},
-	});
-}
-
-function applyGrillPlan(current: PlanFlowState, params: GrillPlanInput): PlanFlowState {
-	const incoming = params.open_questions.map((question, index) => {
-		const resolution = question.resolution?.trim();
-		if (question.status === "resolved" && !isExecutableResolution(resolution)) {
-			throw new Error(`grill_plan: resolved topic '${question.topic}' needs an executable resolution, not '${resolution ?? ""}'.`);
-		}
-		return {
-			id: slugify(question.topic) || `question-${index + 1}`,
-			topic: question.topic.trim(),
-			question: question.question.trim(),
-			whyMatters: question.why_matters.trim(),
-			status: question.status,
-			resolution,
-		} satisfies OpenQuestion;
-	});
-
-	const byTopic = new Map<string, OpenQuestion>();
-	for (const existing of current.questions) byTopic.set(existing.topic, existing);
-	for (const question of incoming) {
-		const previous = byTopic.get(question.topic);
-		if (previous?.status === "resolved" && question.status !== "resolved") continue;
-		byTopic.set(question.topic, { ...previous, ...question });
-	}
-
-	return touch({
-		...current,
-		phase: params.restart_research ? "research" : "grilling",
-		questions: [...byTopic.values()],
-	});
-}
-
-async function askPlanQuestion(ctx: ExtensionContext, params: PlanAskInput): Promise<string | undefined> {
-	const options = params.options ?? [];
-	if (options.length === 0) return (await ctx.ui.input(params.question, "Type your answer..."))?.trim() || undefined;
-	const labels = options.map((option) => option.description ? `${option.label} — ${option.description}` : option.label);
-	if (params.allowOther !== false) labels.push("Other / custom answer");
-	const selected = await ctx.ui.select(params.question, labels);
-	if (!selected) return undefined;
-	const otherIndex = labels.length - 1;
-	if (params.allowOther !== false && labels.indexOf(selected) === otherIndex) {
-		return (await ctx.ui.input("Custom answer", "Type your answer..."))?.trim() || undefined;
-	}
-	const option = options[labels.indexOf(selected)];
-	return option ? option.value ?? option.label : selected;
-}
-
-function recordPlanAnswer(current: PlanFlowState, params: PlanAskInput, answer: string): PlanFlowState {
-	const now = new Date().toISOString();
-	const questions = [...current.questions];
-	const index = questions.findIndex((question) => question.topic === params.topic);
-	const nextQuestion: OpenQuestion = {
-		id: index >= 0 ? questions[index].id : slugify(params.topic) || `question-${questions.length + 1}`,
-		topic: params.topic,
-		question: params.question,
-		whyMatters: params.whyMatters,
-		status: isExecutableResolution(answer) ? "resolved" : "open",
-		resolution: isExecutableResolution(answer) ? answer : undefined,
-		answer,
-		askedAt: index >= 0 ? questions[index].askedAt ?? now : now,
-		answeredAt: now,
-	};
-	if (index >= 0) questions[index] = { ...questions[index], ...nextQuestion };
-	else questions.push(nextQuestion);
-	return touch({ ...current, questions, askCount: current.askCount + 1 });
-}
-
-function buildGrillPlanResult(state: PlanFlowState): string {
-	const open = state.questions.filter((question) => question.status === "open");
-	if (state.phase === "research") return "Research restarted. Keep resolved decisions and inspect more files before calling grill_plan again.";
-	if (open.length === 0) return "No open critical questions. Call grill_done to proceed to drafting.";
-	return `Recorded ${open.length} open critical question(s). Ask them one at a time with plan_ask, or call grill_done if you can proceed with explicit assumptions. Remaining question budget: ${Math.max(0, state.maxAskCount - state.askCount)}.`;
 }
 
 function buildPlanWriteResult(state: PlanFlowState): string {
-	// rev.3: positive, decisive B-class tool result. drafting plan_write is a
-	// tool-execute transition (streaming), so triggerTurn cannot start a clean new
-	// turn here; the decisive result text guides the model to converge (wait for
-	// review) within the current turn.
 	if (state.reviewPending) return `Plan draft '${state.title}' written. Automatic review is pending; wait for it before doing anything else.`;
-	return `Plan '${state.title}' written. Call plan_exit to request user approval.`;
+	return `Plan '${state.title}' written. Wait for extension-owned approval.`;
 }
 
 async function runAutomaticReview(ctx: ExtensionContext, state: PlanFlowState): Promise<PlanFlowState> {
@@ -914,18 +579,19 @@ function applyPlanWrite(current: PlanFlowState, params: PlanWriteInput): PlanFlo
 		}
 	}
 
-	const nextPhase: Phase = current.phase === "drafting" ? "drafting" : "awaiting_approval";
 	return touch({
 		...current,
-		phase: nextPhase,
+		phase: "reviewing",
 		title: params.title.trim(),
 		background: params.background.trim(),
+		decisions: params.decisions?.map((decision) => decision.trim()).filter(Boolean) ?? [],
+		assumptions: params.assumptions?.map((assumption) => assumption.trim()).filter(Boolean) ?? [],
 		steps,
 		risks: params.risks?.map((risk) => risk.trim()).filter(Boolean) ?? [],
-		reviewed: current.phase !== "drafting",
-		reviewPending: current.phase === "drafting",
-		reviewSkipped: current.phase === "drafting" ? false : current.reviewSkipped,
-		reviewSkippedReason: current.phase === "drafting" ? undefined : current.reviewSkippedReason,
+		reviewed: false,
+		reviewPending: true,
+		reviewSkipped: false,
+		reviewSkippedReason: undefined,
 	});
 }
 
@@ -1045,48 +711,47 @@ async function runApprovalDialog(pi: ExtensionAPI, ctx: ExtensionContext, curren
 	return { kind: "approved", state: approved };
 }
 
-/** rev.3 P0-3/P0-4: drive the post-review flow from the turn_end handler (A-class).
+/** Drive post-review state changes from the turn_end handler.
  *
- * `state` has already been persisted/narrowed/UI-updated by the caller (the review
- * turn_end handler) for the reviewing->revising/awaiting_approval transition, so here
- * we only drive the next turn. For the approved branch we additionally run the dialog
- * (which re-persists the executing state) and then kickTurn the execution turn. */
+ * `state` has already been persisted/narrowed/UI-updated by the caller for the
+ * reviewing->revising/awaiting_approval transition. Any follow-up model instruction is
+ * queued for the next real prompt instead of triggered immediately, avoiding stale tool
+ * snapshots that cannot see plan_write/plan_exit/todo_write yet. */
 async function drivePostReview(pi: ExtensionAPI, ctx: ExtensionContext, state: PlanFlowState): Promise<void> {
 	if (state.phase === "revising") {
 		const issueCount = state.reviewFeedback?.blockingIssues.length ?? 0;
 		if (ctx.hasUI) ctx.ui.notify(`Automatic review found ${issueCount} blocking issue(s); revising.`, "warning");
-		// state already persisted/narrowed/UI-updated for revising. The kick is
-		// display:false (zero visible noise) but enters the LLM context, so it carries
-		// the blocking issues the model must address — replacing the old visible steer.
-		kickTurn(pi, `Address the automatic review feedback and call plan_write with the revised plan.\nBlocking issues:\n${formatReviewIssues(state)}`);
+		queueNextTurnInstruction(pi, `Address the automatic review feedback and call plan_write with the revised plan.\nBlocking issues:\n${formatReviewIssues(state)}`);
 		return;
 	}
 
 	// phase === awaiting_approval (review passed or skipped)
-	if (ctx.hasUI) {
-		// Direct approval dialog — no visible steering text, no need for the model to
-		// call plan_exit. hasUI guard: headless falls through to the else branch.
-		const outcome = await runApprovalDialog(pi, ctx, state);
-		if (outcome.kind === "approved") {
-			ctx.ui.notify(`Plan approved · ${outcome.state.finalPath ?? ""}`, "info");
-			// A-class: state is executing (persisted/narrowed by runApprovalDialog);
-			// kick a clean execution turn so the model starts todo_write without the
-			// user having to say "continue".
-			kickTurn(pi, "Plan approved. Begin execution: todo_write the first step as in_progress.");
-			return;
-		}
-		if (outcome.kind === "revising") {
-			// runApprovalDialog already persisted/narrowed/UI-updated revising.
-			kickTurn(pi, "Address the revision request and call plan_write with the revised plan.");
-			return;
-		}
-		// cancelled: abortPlan already persisted + cleared UI; no turn to kick.
+	if (state.approvalMode === "auto") {
+		const approved = await approvePlan(pi, ctx, state);
+		persistPlanState(pi, approved, "approval");
+		applyActiveTools(pi, approved);
+		updatePlanUi(ctx, approved);
+		if (ctx.hasUI) ctx.ui.notify(`Plan auto-approved · ${approved.finalPath ?? ""}`, "info");
+		queueNextTurnInstruction(pi, "Plan approved. Begin execution: todo_write the first step as in_progress.");
 		return;
 	}
 
-	// Headless (no UI): cannot show a dialog. Kick a turn so the model calls
-	// plan_exit, whose headless branch auto-approves (see plan_exit execute).
-	kickTurn(pi, "Plan is ready for approval; call plan_exit to approve it.");
+	if (!ctx.hasUI) {
+		await abortPlan(pi, ctx, state, "approvalMode ui requires an interactive UI");
+		return;
+	}
+
+	const outcome = await runApprovalDialog(pi, ctx, state);
+	if (outcome.kind === "approved") {
+		ctx.ui.notify(`Plan approved · ${outcome.state.finalPath ?? ""}`, "info");
+		queueNextTurnInstruction(pi, "Plan approved. Begin execution: todo_write the first step as in_progress.");
+		return;
+	}
+	if (outcome.kind === "revising") {
+		queueNextTurnInstruction(pi, "Address the revision request and call plan_write with the revised plan.");
+		return;
+	}
+	// cancelled: abortPlan already persisted + cleared UI; no turn to kick.
 }
 
 async function renderDraft(ctx: ExtensionContext, state: PlanFlowState) {
@@ -1135,9 +800,13 @@ function renderPlanMarkdown(state: PlanFlowState): string {
 	lines.push("");
 	lines.push("## Decisions");
 	lines.push("");
-	const resolvedQuestions = state.questions.filter((question) => question.status === "resolved" && question.resolution);
-	if (resolvedQuestions.length === 0) lines.push("- None recorded.");
-	else resolvedQuestions.forEach((question) => lines.push(`- ${question.topic}: ${question.resolution}`));
+	if (state.decisions.length === 0) lines.push("- None recorded.");
+	else state.decisions.forEach((decision) => lines.push(`- ${decision}`));
+	lines.push("");
+	lines.push("## Assumptions");
+	lines.push("");
+	if (state.assumptions.length === 0) lines.push("- None recorded.");
+	else state.assumptions.forEach((assumption) => lines.push(`- ${assumption}`));
 	lines.push("");
 	const pc = state.planningContext;
 	if (pc && (pc.sourceCommand || pc.profiles?.length || pc.mandatoryValidation?.length || pc.declaredFiles?.length)) {
@@ -1174,9 +843,7 @@ function renderPlanMarkdown(state: PlanFlowState): string {
 }
 
 function getAllowedToolsForState(state: PlanFlowState): string[] {
-	return getAllowedToolsForPhase(state.phase, state.previousActiveTools, {
-		hasOpenGrillingQuestions: state.phase === "grilling" && state.questions.some((question) => question.status === "open"),
-	});
+	return getAllowedToolsForPhase(state.phase, state.previousActiveTools);
 }
 
 function applyActiveTools(pi: ExtensionAPI, state: PlanFlowState) {
@@ -1209,37 +876,44 @@ function updatePlanUi(ctx: ExtensionContext, state: PlanFlowState) {
 	}
 }
 
-/** rev.3 P0-5: trigger a clean new turn with a one-line, display:false kick.
+/** Start an immediate hidden continuation turn.
  *
- * `display:false` keeps the kick out of the visible transcript (zero visible noise);
- * the one-line content still enters the LLM context. Only fires a real new turn when
- * the agent is not streaming, so this is only correct from turn_end handlers (A-class
- * transition points). Inside a tool execute() the agent is streaming and triggerTurn
- * silently degrades to a steer — see advancePhase doc. */
-function kickTurn(pi: ExtensionAPI, content: string) {
+ * Only use this from command/programmatic entry points that are not already inside the
+ * agent loop. Do not use it from tool_result/turn_end driven phase transitions: Pi may
+ * deliver triggerTurn messages as steering in the same frozen tool snapshot, so the
+ * newly-enabled phase tool (plan_write/plan_exit/todo_write) may still be unavailable.
+ */
+function triggerPlanTurn(pi: ExtensionAPI, content: string) {
 	pi.sendMessage(
 		{ customType: PLAN_KICK_CUSTOM_TYPE, content, display: false },
 		{ triggerTurn: true },
 	);
 }
 
-/** rev.3 P0-5: A-class (turn_end) phase transition helper.
+/** Queue a hidden continuation instruction for the next real user/external prompt.
  *
- * Persists the next state, narrows the active tool set, updates the UI, and triggers a
- * clean new turn with a one-line `display:false` kick. The kick enters the LLM context
- * (one short line) but not the visible transcript, so there is zero visible noise.
+ * This is the conservative yuki-pi-layer recovery for frozen tool snapshots: phase
+ * transitions still persist/narrow tools immediately, but we do not ask the current
+ * running agent loop to continue with tools it cannot see yet.
+ */
+function queueNextTurnInstruction(pi: ExtensionAPI, content: string) {
+	pi.sendMessage(
+		{ customType: PLAN_KICK_CUSTOM_TYPE, content, display: false },
+		{ deliverAs: "nextTurn" },
+	);
+}
+
+/** Plan-flow entry phase helper.
  *
- * Only valid from turn_end handlers (where `!isStreaming` so `triggerTurn` actually
- * starts a new turn). Calling this from a tool `execute()` is a bug: tool execute runs
- * inside the streaming turn loop, so `sendCustomMessage(triggerTurn)` silently degrades
- * to a steer and does NOT start a clean narrowed turn (see rev.3 note, rev.3 §P0-5). For
- * tool-execute transitions use a positive, decisive tool-result string instead.
+ * Persists the next state, narrows the active tool set, updates the UI, and starts the
+ * first research turn. This is used by /plan/startPlanFlow, not by turn_end phase
+ * convergence.
  */
 function advancePhase(pi: ExtensionAPI, ctx: ExtensionContext, next: PlanFlowState, kickContent: string, reason: PlanStateRecord["reason"] = "phase_change") {
 	persistPlanState(pi, next, reason);
-	applyActiveTools(pi, next); // takes effect on the next turn (the one we are about to start)
+	applyActiveTools(pi, next);
 	updatePlanUi(ctx, next);
-	kickTurn(pi, kickContent);
+	triggerPlanTurn(pi, kickContent);
 }
 
 /** rev.4 P1-1: programmatic entry point for callers like /ta-dev that want to start a
@@ -1255,11 +929,13 @@ function advancePhase(pi: ExtensionAPI, ctx: ExtensionContext, next: PlanFlowSta
  *
  * Accepts the same `ctx` shape as the `/plan` command handler (ExtensionCommandContext
  * extends ExtensionContext), and an optional pre-built `PlanningContext` so callers do
- * not need to write+consume a `--context` handoff file either.
+ * not need to write+consume a `--context` handoff file either. Programmatic callers such
+ * as /ta-dev must pass `approvalMode: "auto"` explicitly; `/plan` passes `"ui"`.
  */
 export interface StartPlanFlowOptions {
 	request: string;
 	planningContext?: PlanningContext;
+	approvalMode: ApprovalMode;
 }
 
 export async function startPlanFlow(pi: ExtensionAPI, ctx: ExtensionContext, opts: StartPlanFlowOptions): Promise<void> {
@@ -1274,22 +950,28 @@ export async function startPlanFlow(pi: ExtensionAPI, ctx: ExtensionContext, opt
 		return;
 	}
 
+	const approvalMode = opts.approvalMode;
+	if (!ctx.hasUI && approvalMode === "ui") {
+		ctx.ui.notify("yuki plan-flow: approvalMode 'ui' requires an interactive UI. Trusted headless callers must pass approvalMode:'auto'.", "warning");
+		return;
+	}
+
 	const now = new Date().toISOString();
 	const previousActiveTools = pi.getActiveTools();
 	const state: PlanFlowState = {
 		version: 1,
 		active: true,
-		phase: "research",
+		phase: "planning",
 		planId: createPlanId(),
 		request,
 		planningContext: opts.planningContext,
 		previousActiveTools,
 		currentActiveTools: [],
-		questions: [],
-		askCount: 0,
-		maxAskCount: 5,
 		steps: [],
+		decisions: [],
+		assumptions: [],
 		risks: [],
+		approvalMode,
 		reviewed: false,
 		reviewPending: false,
 		approved: false,
@@ -1300,18 +982,18 @@ export async function startPlanFlow(pi: ExtensionAPI, ctx: ExtensionContext, opt
 	state.draftPath = `.pi/plan-draft-${state.planId}.md`;
 	state.currentActiveTools = getAllowedToolsForState(state);
 
-	// rev.3 P0-1: drive the first turn with a display:false kick instead of a visible
+	// Drive the first turn with a display:false kick instead of a visible
 	// sendUserMessage. The command handler itself does not start a turn, and at this
 	// point the agent is not streaming, so advancePhase's sendMessage(triggerTurn)
-	// starts a clean, narrowed research turn with zero visible noise. The detailed
-	// research instructions come from before_agent_start -> buildPhasePrompt (research).
-	ctx.ui.notify(`yuki plan-flow started · phase: research · plan ${state.planId}`, "info");
+	// starts a clean, narrowed planning turn with zero visible noise. The detailed
+	// planning instructions come from the context event mode prompt.
+	ctx.ui.notify(`yuki plan-flow started · phase: planning · plan ${state.planId}`, "info");
 	advancePhase(pi, ctx, state, buildKickoffContent(state), "plan_start");
 }
 
-/** Compact one-line research kickoff (display:false, used by advancePhase at /plan start). */
+/** Compact one-line planning kickoff (display:false, used by advancePhase at /plan start). */
 function buildKickoffContent(state: PlanFlowState): string {
-	return `Start yuki plan-flow research for: ${state.request}. Inspect files read-only with read/grep/find/ls, then call grill_plan with critical decision questions.`;
+	return `Start yuki planning mode for: ${state.request}. Inspect files read-only with read/grep/find/ls, ask only critical questions if needed, then call plan_write with a decision-complete structured plan.`;
 }
 
 function buildBlockedToolReason(state: PlanFlowState, _toolName: string, allowed: string[], attempts: number): string {
@@ -1319,8 +1001,8 @@ function buildBlockedToolReason(state: PlanFlowState, _toolName: string, allowed
 	// that names only the ALLOWED tool. The blocked tool name is intentionally never
 	// mentioned (naming it re-primes the model toward the very tool we are narrowing
 	// away — the root of the drafting plan_ask deadloop in the incident). The mid-turn
-	// block is a stopgap; the real fix is the turn_end convergence guard, which re-kicks
-	// a clean narrowed turn so the disallowed tool is no longer presented at all.
+	// block is a stopgap; the durable fix is state-sensitive tool narrowing plus queued
+	// next-turn instructions, so stale running-loop snapshots are not steered further.
 	const allowedList = allowed.length > 0 ? allowed.join(", ") : "(automatic review is running)";
 	if (attempts >= 2) {
 		// Short, direct, action-only. Repeating the long calm line verbatim read like a
@@ -1331,12 +1013,10 @@ function buildBlockedToolReason(state: PlanFlowState, _toolName: string, allowed
 }
 
 function nextActionHint(state: PlanFlowState): string {
-	if (state.phase === "research") return "Inspect files read-only, then call grill_plan.";
-	if (state.phase === "grilling") return "Call plan_ask for an unresolved critical question, or call grill_done to proceed.";
-	if (state.phase === "drafting") return "Call plan_write with the structured plan, then wait for automatic review.";
+	if (state.phase === "planning") return "Inspect read-only, ask only critical questions if needed, then call plan_write.";
 	if (state.phase === "reviewing") return "Wait; automatic review is running.";
 	if (state.phase === "revising") return "Call plan_write with the revised plan.";
-	if (state.phase === "awaiting_approval") return "Call plan_exit to open the approval dialog.";
+	if (state.phase === "awaiting_approval") return state.approvalMode === "auto" ? "Wait; extension auto-approval is running." : "Use the approval dialog.";
 	if (state.phase === "executing") return `Use todo_read/todo_write on ${state.todoListId ?? "the plan-owned todo list"}.`;
 	return "Follow the yuki plan-flow phase prompt.";
 }
@@ -1355,10 +1035,9 @@ function nextActionHint(state: PlanFlowState): string {
  *
  * Instead: plan tools always execute and return `terminate: true`. When called in the
  * wrong phase/state, they return this decisive "call X instead" result AND end the turn.
- * The turn_end convergence guard then kicks a clean, narrowed turn whose surface offers
- * only the correct tool (setActiveTools), so the model physically cannot pick the wrong
- * plan tool again. The clean-turn surface is the real hard constraint; this result makes
- * the frozen-surface turn exit cleanly instead of loop-blocking. */
+ * The active tool set is narrowed for the next real prompt; any continuation hint is
+ * queued with deliverAs:"nextTurn" rather than steered into the current frozen snapshot.
+ * This result makes the frozen-surface turn exit cleanly instead of loop-blocking. */
 function buildWrongPhaseResult(toolName: string, state: PlanFlowState, extra?: string): { content: Array<{ type: "text"; text: string }>; details: { state: PlanFlowState }; terminate: true } {
 	const hint = nextActionHint(state);
 	const text = extra
@@ -1372,25 +1051,26 @@ function buildWrongPhaseResult(toolName: string, state: PlanFlowState, extra?: s
 }
 
 function buildPhasePrompt(state: PlanFlowState): string {
-	// rev.3: positive-only wording. Each branch says only what to call, never naming
-	// disallowed tools (naming them re-primes the model toward the very tool we are
-	// narrowing away — the root of the drafting plan_ask deadloop in the incident).
-	// Disallowed tools are removed from the model's tool set via setActiveTools at the
-	// turn boundary (A-class) or defended by tool_call block mid-turn (B-class).
-	if (state.phase === "research") {
-		return `[YUKI PLAN FLOW: research]\nRead-only planning mode for request: ${state.request}\nInspect files with read/grep/find/ls. When ready, call grill_plan with only critical decision questions.`;
+	if (state.phase === "planning" || state.phase === "revising") {
+		const reviewText = state.phase === "revising" ? `\nAddress these review issues before plan_write:\n${formatReviewIssues(state)}` : "";
+		return [
+			`[YUKI PLAN FLOW: ${state.phase}]`,
+			`Request: ${state.request}`,
+			"Read-only planning mode. Use read/grep/find/ls for repository facts.",
+			"Do not ask facts that can be inspected from the repo or runtime.",
+			"Ask at most five high-impact questions total using ask_user_question if available, otherwise plain assistant text.",
+			"If ambiguity is low-risk, proceed with an explicit assumption and record it in plan_write.assumptions.",
+			"Call plan_write only when the plan is decision-complete enough for another agent to execute.",
+			"plan_write must include files/rationale/validation where relevant, plus decisions and assumptions.",
+			renderPlanningContextGuidance(state),
+			reviewText,
+		].filter(Boolean).join("\n");
 	}
-	if (state.phase === "grilling") {
-		return `[YUKI PLAN FLOW: grilling]\nAsk at most ${state.maxAskCount} critical decision questions total using plan_ask. Current count: ${state.askCount}. Ask only decisions you cannot inspect in the repo. Valid resolutions are concrete (not 随便/都行/看情况/之后再说/无所谓/不知道/whatever/TBD/idk or punctuation-only). Call grill_done when ready to draft.`;
-	}
-	if (state.phase === "drafting") {
-		return `[YUKI PLAN FLOW: drafting]\nCall plan_write with the structured plan, then wait for the automatic review.${renderPlanningContextGuidance(state)}`;
-	}
-	if (state.phase === "revising") {
-		return "[YUKI PLAN FLOW: revising]\nCall plan_write with the revised plan addressing the review feedback.";
+	if (state.phase === "reviewing") {
+		return "[YUKI PLAN FLOW: reviewing]\nAutomatic review is running. Do not call tools unless the extension asks for a revised plan.";
 	}
 	if (state.phase === "awaiting_approval") {
-		return "[YUKI PLAN FLOW: awaiting approval]\nThe plan is ready; the approval dialog will open automatically. If asked, call plan_exit to open it.";
+		return "[YUKI PLAN FLOW: awaiting approval]\nApproval is extension/UI-owned. Do not call an approval tool.";
 	}
 	if (state.phase === "executing") {
 		return `[YUKI PLAN FLOW: executing]\nThe plan is approved. Use todo_read/todo_write to track progress for list ${state.todoListId}. Keep at most one in_progress and provide evidence for completed items.`;
@@ -1403,7 +1083,7 @@ function formatPlanStatus(state: PlanFlowState): string {
 		`Plan ${state.planId}`,
 		`Phase: ${state.phase}`,
 		`Title: ${state.title ?? "(none)"}`,
-		`Questions: ${state.askCount}/${state.maxAskCount}`,
+		`Approval mode: ${state.approvalMode}`,
 		`Steps: ${state.steps.length}`,
 		`Review: ${state.reviewSkipped ? `skipped (${state.reviewSkippedReason})` : state.reviewed ? "completed" : state.reviewPending ? "pending" : "not completed"}`,
 		`Draft: ${state.draftPath}`,
@@ -1424,14 +1104,19 @@ function formatPlanningContextSummary(state: PlanFlowState): string {
 }
 
 function normalizePlanState(state: PlanFlowState): PlanFlowState {
+	const rawState = state as unknown as { phase?: string; questions?: Array<{ topic?: string; status?: string; resolution?: string }> };
+	const rawPhase = rawState.phase;
+	const phase: Phase = rawPhase === "research" || rawPhase === "grilling" || rawPhase === "drafting" ? "planning" : (rawPhase as Phase) ?? "idle";
+	const legacyDecisions = (rawState.questions ?? []).filter((question) => question.status === "resolved" && question.resolution).map((question) => `${question.topic ?? "Decision"}: ${question.resolution}`);
 	return {
 		...state,
 		version: 1,
-		questions: state.questions ?? [],
-		askCount: state.askCount ?? 0,
-		maxAskCount: state.maxAskCount ?? 5,
+		phase,
 		steps: state.steps ?? [],
+		decisions: state.decisions ?? legacyDecisions,
+		assumptions: state.assumptions ?? [],
 		risks: state.risks ?? [],
+		approvalMode: state.approvalMode ?? "ui",
 		previousActiveTools: state.previousActiveTools ?? [],
 		currentActiveTools: state.currentActiveTools ?? [],
 		planningContext: state.planningContext ?? undefined,
