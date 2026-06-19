@@ -416,11 +416,28 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 		if (!state?.active || state.phase !== "awaiting_approval" || state.approvalMode !== "ui") return;
 		if (approvalInFlight) return;
 		approvalInFlight = true;
-		try {
-			await driveUiApproval(pi, ctx, state);
-		} finally {
-			approvalInFlight = false;
-		}
+		// agent_end fires while isStreaming is STILL true: agent-core clears
+		// isStreaming in finishRun() only AFTER all agent_end listeners settle
+		// (see runWithLifecycle in agent.js). Publishing the preview now would route
+		// pi.sendMessage({display:true}) into agent.steer() (the isStreaming branch
+		// of sendCustomMessage), so the preview stays hidden in the steering queue
+		// and only renders after the next agent continuation — i.e. AFTER the user
+		// approves. It also pollutes LLM context as a steering message. Defer to the
+		// next macrotask so finishRun() has run, isStreaming is false, sendMessage
+		// renders the full plan into the chat history, and only then the approval
+		// selector opens below it.
+		const planId = state.planId;
+		setTimeout(() => {
+			(async () => {
+				try {
+					await driveUiApproval(pi, ctx, planId);
+				} catch (err) {
+					ctx.ui.notify?.(`yuki plan-flow: approval failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+				} finally {
+					approvalInFlight = false;
+				}
+			})();
+		}, 0);
 	});
 
 	// rev.3 P1-1: auto-close a plan once its plan-owned todo list is fully completed.
@@ -815,14 +832,14 @@ async function runApprovalDialog(pi: ExtensionAPI, ctx: ExtensionContext, curren
 	return { kind: "approved", state: approved };
 }
 
-async function driveUiApproval(pi: ExtensionAPI, ctx: ExtensionContext, state: PlanFlowState): Promise<void> {
+async function driveUiApproval(pi: ExtensionAPI, ctx: ExtensionContext, planId: string): Promise<void> {
+	const current = reconstructPlanState(ctx);
+	if (!current?.active || current.phase !== "awaiting_approval" || current.planId !== planId) return;
 	if (!ctx.hasUI) {
-		await abortPlan(pi, ctx, state, "approvalMode ui requires an interactive UI");
+		await abortPlan(pi, ctx, current, "approvalMode ui requires an interactive UI");
 		return;
 	}
 
-	const current = reconstructPlanState(ctx);
-	if (!current?.active || current.phase !== "awaiting_approval" || current.planId !== state.planId) return;
 	const outcome = await runApprovalDialog(pi, ctx, current);
 	if (outcome.kind === "approved") {
 		const kicked = markExecutionKickSent(outcome.state);
@@ -845,8 +862,9 @@ async function driveUiApproval(pi: ExtensionAPI, ctx: ExtensionContext, state: P
  * reviewing->revising/awaiting_approval transition. Blocking review feedback is an
  * internal revision loop, not a user stop point: trigger an immediate follow-up turn so
  * the agent explains the rejection and calls plan_write again without waiting for a new
- * user prompt. UI approval is deferred until agent_end so its history preview can render
- * after streaming has stopped and before the compact approval controls open. */
+ * user prompt. UI approval is deferred until the next macrotask after agent_end so
+ * its history preview can render once isStreaming is false (agent_end itself fires
+ * before finishRun clears isStreaming) and before the inline approval selector opens. */
 async function drivePostReview(pi: ExtensionAPI, ctx: ExtensionContext, state: PlanFlowState): Promise<void> {
 	if (state.phase === "revising") {
 		const issueCount = state.reviewFeedback?.blockingIssues.length ?? 0;

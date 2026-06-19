@@ -90,9 +90,12 @@ describe("plan-flow v2 integration guards", () => {
 		assert.match(source, /message\.customType === PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE/);
 		assert.match(source, /function publishApprovalPreview/);
 		assert.match(source, /customType: PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE[\s\S]*display: true/);
-		assert.match(source, /pi\.on\("agent_end"[\s\S]*driveUiApproval\(pi, ctx, state\)/);
-		assert.match(source, /function driveUiApproval/);
-		assert.match(source, /UI approval is deferred until agent_end/);
+		assert.match(source, /pi\.on\("agent_end"[\s\S]*setTimeout\(\(\) => \{[\s\S]*driveUiApproval\(pi, ctx, planId\)/);
+		assert.match(source, /function driveUiApproval\(pi: ExtensionAPI, ctx: ExtensionContext, planId: string\)/);
+		assert.match(source, /agent_end fires while isStreaming is STILL true/);
+		assert.match(source, /finishRun\(\) only AFTER all agent_end listeners settle/);
+		assert.match(source, /route[\s\S]*pi\.sendMessage[\s\S]*into agent\.steer/);
+		assert.match(source, /UI approval is deferred until the next macrotask after agent_end/);
 		assert.match(source, /function renderApprovalPreviewMarkdown/);
 		assert.match(source, /renderPlanMarkdown\(state\)\.trim\(\)/);
 		assert.match(source, /publishApprovalPreview\(pi, current, message\)/);
