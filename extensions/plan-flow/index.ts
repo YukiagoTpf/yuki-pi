@@ -113,12 +113,26 @@ const PlanStepInputSchema = Type.Object({
 });
 
 const PlanWriteParams = Type.Object({
-	title: Type.String(),
-	background: Type.String(),
+	mode: Type.Optional(Type.Union([
+		Type.Literal("full"),
+		Type.Literal("skeleton"),
+		Type.Literal("patch"),
+	], { description: "full overwrites and submits for review; skeleton saves title+steps only; patch updates fields on the current draft" })),
+	title: Type.Optional(Type.String()),
+	background: Type.Optional(Type.String()),
 	decisions: Type.Optional(Type.Array(Type.String({ description: "Resolved implementation decisions that remove ambiguity" }))),
 	assumptions: Type.Optional(Type.Array(Type.String({ description: "Explicit assumptions the implementation may rely on" }))),
-	steps: Type.Array(PlanStepInputSchema, { minItems: 1 }),
+	steps: Type.Optional(Type.Array(PlanStepInputSchema, { minItems: 1 })),
 	risks: Type.Optional(Type.Array(Type.String())),
+	field: Type.Optional(Type.Union([
+		Type.Literal("title"),
+		Type.Literal("background"),
+		Type.Literal("decisions"),
+		Type.Literal("assumptions"),
+		Type.Literal("steps"),
+		Type.Literal("risks"),
+	], { description: "For mode:'patch', a single field to replace" })),
+	value: Type.Optional(Type.Any({ description: "For mode:'patch', replacement value for field" })),
 });
 
 type PlanWriteInput = Static<typeof PlanWriteParams>;
@@ -507,6 +521,7 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			"plan_write is the source of truth for plan steps; do not create free-form plan markdown instead.",
 			"Each plan_write step must include content and activeForm, and should include validation when possible.",
 			"Include decisions and assumptions explicitly so the implementation has no unresolved branches.",
+			"For large plans, use mode:'skeleton' for title+steps, mode:'patch' for local additions, and mode:'full' only when ready for review.",
 			PLAN_WRITE_BUDGET_GUIDANCE,
 		],
 		parameters: PlanWriteParams,
@@ -556,6 +571,7 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 
 function buildPlanWriteResult(state: PlanFlowState): string {
 	if (state.reviewPending) return `Plan draft '${state.title}' written. Automatic review is pending; wait for it before doing anything else.`;
+	if (state.phase === "planning" || state.phase === "revising") return `Partial plan draft '${state.title ?? state.planId}' saved. Continue with plan_write mode:'patch' to add details, or mode:'full' when ready for review.`;
 	return `Plan '${state.title}' written. Wait for extension-owned approval.`;
 }
 
@@ -682,8 +698,8 @@ function persistPlanState(pi: ExtensionAPI, state: PlanFlowState, reason: PlanSt
 	pi.appendEntry(PLAN_STATE_CUSTOM_TYPE, { kind: state.phase === "aborted" ? "abort" : "snapshot", reason, planId: state.planId, state } satisfies PlanStateRecord);
 }
 
-function applyPlanWrite(current: PlanFlowState, params: PlanWriteInput): PlanFlowState {
-	const steps = params.steps.map((step, index) => ({
+function normalizePlanWriteSteps(rawSteps: PlanWriteInput["steps"]): PlanStep[] {
+	const steps = (rawSteps ?? []).map((step, index) => ({
 		id: step.id?.trim() || `step-${index + 1}`,
 		content: step.content.trim(),
 		activeForm: step.activeForm.trim(),
@@ -693,34 +709,99 @@ function applyPlanWrite(current: PlanFlowState, params: PlanWriteInput): PlanFlo
 		dependsOn: step.dependsOn?.filter(Boolean),
 	}));
 
+	if (steps.length === 0) throw new Error("plan_write: steps must include at least one item.");
 	if (steps.some((step) => !step.content || !step.activeForm)) {
 		throw new Error("plan_write: every step must include non-empty content and activeForm.");
 	}
+	return steps;
+}
 
+function normalizeStringArray(value: string[] | undefined): string[] {
+	return value?.map((item) => item.trim()).filter(Boolean) ?? [];
+}
+
+function requirePlanWriteString(value: string | undefined, field: string): string {
+	const normalized = value?.trim();
+	if (!normalized) throw new Error(`plan_write: ${field} is required for this mode.`);
+	return normalized;
+}
+
+function assertMandatoryValidationCovered(current: PlanFlowState, steps: PlanStep[]) {
 	// rev.3 P0-2: when a planning context declared mandatory validation/sensors, the
 	// plan as a whole must cover every mandatory item across its steps' validation
 	// entries (case-insensitive substring match, so "unity-csharp-compile" matches a
 	// step validation phrase that contains it). Missing items are reported so the
 	// model can add them rather than silently dropping the constraint.
 	const mandatory = current.planningContext?.mandatoryValidation?.filter(Boolean) ?? [];
-	if (mandatory.length > 0) {
-		const check = checkMandatoryValidation(steps.map((step) => step.validation ?? []), mandatory);
-		if (!check.ok) {
-			throw new Error(
-				`plan_write: mandatory validation not covered by any step: [${check.missing.join(", ")}]. Add the missing sensor(s) to the relevant steps' validation.`,
-			);
-		}
+	if (mandatory.length === 0) return;
+	const check = checkMandatoryValidation(steps.map((step) => step.validation ?? []), mandatory);
+	if (!check.ok) {
+		throw new Error(
+			`plan_write: mandatory validation not covered by any step: [${check.missing.join(", ")}]. Add the missing sensor(s) to the relevant steps' validation.`,
+		);
+	}
+}
+
+function applySinglePlanPatch(draft: PlanFlowState, field: PlanWriteInput["field"], value: unknown): PlanFlowState {
+	if (!field) return draft;
+	if (field === "title") return { ...draft, title: requirePlanWriteString(typeof value === "string" ? value : undefined, "value") };
+	if (field === "background") return { ...draft, background: requirePlanWriteString(typeof value === "string" ? value : undefined, "value") };
+	if (field === "steps") return { ...draft, steps: normalizePlanWriteSteps(Array.isArray(value) ? value as PlanWriteInput["steps"] : undefined) };
+	if (field === "decisions") return { ...draft, decisions: normalizeStringArray(Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : undefined) };
+	if (field === "assumptions") return { ...draft, assumptions: normalizeStringArray(Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : undefined) };
+	if (field === "risks") return { ...draft, risks: normalizeStringArray(Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : undefined) };
+	return draft;
+}
+
+function applyPlanWrite(current: PlanFlowState, params: PlanWriteInput): PlanFlowState {
+	const mode = params.mode ?? "full";
+	if (mode === "skeleton") {
+		const steps = normalizePlanWriteSteps(params.steps);
+		return touch({
+			...current,
+			title: requirePlanWriteString(params.title, "title"),
+			background: params.background?.trim() || current.background,
+			decisions: params.decisions ? normalizeStringArray(params.decisions) : current.decisions,
+			assumptions: params.assumptions ? normalizeStringArray(params.assumptions) : current.assumptions,
+			steps,
+			risks: params.risks ? normalizeStringArray(params.risks) : current.risks,
+			reviewed: false,
+			reviewPending: false,
+			reviewSkipped: false,
+			reviewSkippedReason: undefined,
+			reviewFeedback: undefined,
+		});
 	}
 
+	if (mode === "patch") {
+		let patched = applySinglePlanPatch(current, params.field, params.value);
+		if (params.title !== undefined) patched = { ...patched, title: requirePlanWriteString(params.title, "title") };
+		if (params.background !== undefined) patched = { ...patched, background: requirePlanWriteString(params.background, "background") };
+		if (params.steps !== undefined) patched = { ...patched, steps: normalizePlanWriteSteps(params.steps) };
+		if (params.decisions !== undefined) patched = { ...patched, decisions: normalizeStringArray(params.decisions) };
+		if (params.assumptions !== undefined) patched = { ...patched, assumptions: normalizeStringArray(params.assumptions) };
+		if (params.risks !== undefined) patched = { ...patched, risks: normalizeStringArray(params.risks) };
+		return touch({
+			...patched,
+			reviewed: false,
+			reviewPending: false,
+			reviewSkipped: false,
+			reviewSkippedReason: undefined,
+			reviewFeedback: undefined,
+		});
+	}
+
+	const steps = normalizePlanWriteSteps(params.steps);
+	assertMandatoryValidationCovered(current, steps);
 	return touch({
 		...current,
 		phase: "reviewing",
-		title: params.title.trim(),
-		background: params.background.trim(),
-		decisions: params.decisions?.map((decision) => decision.trim()).filter(Boolean) ?? [],
-		assumptions: params.assumptions?.map((assumption) => assumption.trim()).filter(Boolean) ?? [],
+		title: requirePlanWriteString(params.title, "title"),
+		background: requirePlanWriteString(params.background, "background"),
+		decisions: normalizeStringArray(params.decisions),
+		assumptions: normalizeStringArray(params.assumptions),
 		steps,
-		risks: params.risks?.map((risk) => risk.trim()).filter(Boolean) ?? [],
+		risks: normalizeStringArray(params.risks),
 		reviewed: false,
 		reviewPending: true,
 		reviewSkipped: false,
@@ -1345,7 +1426,8 @@ function buildPhasePrompt(state: PlanFlowState): string {
 			"Ask at most five high-impact questions total using ask_user_question if available, otherwise plain assistant text.",
 			"If ambiguity is low-risk, proceed with an explicit assumption and record it in plan_write.assumptions.",
 			"Call plan_write only when the plan is decision-complete enough for another agent to execute.",
-			"plan_write must include files/rationale/validation where relevant, plus decisions and assumptions.",
+			"plan_write modes: skeleton saves title+steps without review; patch updates draft fields; full submits the complete plan for review.",
+			"plan_write full mode must include files/rationale/validation where relevant, plus decisions and assumptions.",
 			PLAN_WRITE_BUDGET_GUIDANCE,
 			renderPlanningContextGuidance(state),
 			reviewText,

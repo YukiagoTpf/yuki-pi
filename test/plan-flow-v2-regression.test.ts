@@ -41,6 +41,14 @@ describe("plan-flow v2 integration guards", () => {
 		assert.doesNotMatch(beforeAgentStart, /PLAN_MODE_PROMPT_CUSTOM_TYPE/);
 	});
 
+	it("supports skeleton and patch plan_write modes before full review", () => {
+		assert.match(source, /Type\.Literal\("skeleton"\)/);
+		assert.match(source, /Type\.Literal\("patch"\)/);
+		assert.match(source, /mode === "skeleton"/);
+		assert.match(source, /mode === "patch"/);
+		assert.match(source, /mode:'full' when ready for review/);
+	});
+
 	it("steers plan_write payloads to stay within an output budget", () => {
 		assert.match(source, /PLAN_WRITE_BUDGET_GUIDANCE/);
 		assert.match(source, /40%-60%/);
