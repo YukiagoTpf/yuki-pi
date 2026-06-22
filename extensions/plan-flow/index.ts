@@ -332,15 +332,6 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 	pi.on("tool_call", async (event, ctx) => {
 		const state = reconstructPlanState(ctx);
 		if (!state?.active || state.phase === "aborted") return;
-		// Block plan_write while an automatic review is running. Otherwise an
-		// interjected turn could land a newer draft that the in-flight review
-		// (built from the older snapshot) would then overwrite on persist.
-		if (reviewInFlight && event.toolName === "plan_write") {
-			return {
-				block: true,
-				reason: "yuki plan-flow: automatic review in progress; wait for the review result before calling plan_write again.",
-			};
-		}
 		// NEVER block plan_write. A blocked call returns an error result with no
 		// `terminate`, so the model can keep retrying it on the frozen mid-turn tool
 		// surface. Let plan_write execute and return a terminating wrong-phase result
@@ -544,6 +535,7 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 					details: { state: current },
 				};
 			}
+			persistPlanState(pi, next, "tool_result");
 			await renderDraft(ctx, next);
 			applyActiveTools(pi, next);
 			updatePlanUi(ctx, next);
@@ -860,6 +852,10 @@ function renderApprovalPreviewMarkdown(state: PlanFlowState, message?: string): 
 }
 
 async function approvePlan(pi: ExtensionAPI, ctx: ExtensionContext, current: PlanFlowState): Promise<PlanFlowState> {
+	const latest = reconstructPlanState(ctx);
+	if (latest?.planId === current.planId && latest.approved && latest.phase === "executing" && latest.todoListId) {
+		return latest;
+	}
 	const approvedAt = new Date().toISOString();
 	const todoListId = `plan-${current.planId}`;
 	const finalPath = await writeFinalPlan(ctx, { ...current, phase: "executing", approved: true, approvedAt, todoListId });

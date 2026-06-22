@@ -65,11 +65,21 @@ describe("plan-flow v2 integration guards", () => {
 		assert.match(source, /If it reports idle, do not call plan_write/);
 	});
 
+	it("keeps plan_write unblocked and persists successful draft state", () => {
+		assert.match(source, /NEVER block plan_write/);
+		assert.doesNotMatch(source, /reviewInFlight && event\.toolName === "plan_write"/);
+		assert.match(source, /persistPlanState\(pi, next, "tool_result"\)/);
+	});
+
 	it("returns a terminating result for stale plan_write calls with no active plan", () => {
 		assert.match(source, /function buildNoActivePlanResult/);
 		assert.match(source, /return buildNoActivePlanResult\("plan_write"\)/);
 		assert.match(source, /there is no active plan/);
 		assert.doesNotMatch(source, /throw new Error\("plan_write: no active yuki plan/);
+	});
+
+	it("makes approval idempotent across repeated entry paths", () => {
+		assert.match(source, /latest\?\.planId === current\.planId && latest\.approved && latest\.phase === "executing"/);
 	});
 
 	it("requires explicit approvalMode for direct callers such as ta-dev", () => {
