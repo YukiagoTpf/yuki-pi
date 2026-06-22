@@ -1,6 +1,6 @@
-# plan-flow code review — 2026-06-20
+# plan-mode code review — 2026-06-20
 
-Scope: `extensions/plan-flow/index.ts` (1408 lines), `extensions/shared/plan-helpers.ts`,
+Scope: originally `extensions/plan-flow/index.ts` (now `extensions/plan-mode/index.ts`), `extensions/shared/plan-helpers.ts`,
 `extensions/shared/constants.ts`, `test/plan-helpers.test.ts`. Reviewed for correctness,
 robustness, concurrency, and elegance after the convergence-loop fixes landed.
 

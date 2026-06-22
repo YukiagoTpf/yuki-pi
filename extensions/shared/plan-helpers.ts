@@ -1,7 +1,7 @@
 /**
- * Pure, dependency-free helpers for the plan-flow extension.
+ * Pure, dependency-free helpers for the plan-mode extension.
  *
- * Kept here (rather than inline in plan-flow/index.ts) so they can be unit
+ * Kept here (rather than inline in plan-mode/index.ts) so they can be unit
  * tested without importing the extension, which pulls in the Pi runtime.
  */
 
@@ -159,7 +159,7 @@ function normalizePlanMode(state?: PlanModeStateLike): PlanModePhase {
 }
 
 /**
- * Compute the allowed tool set for a plan-flow phase.
+ * Compute the allowed tool set for a plan-mode phase.
  *
  * Planning/revising expose one stable model-facing plan tool (`plan_write`) plus
  * repository read/search tools. Approval/review are extension-owned and expose no
@@ -280,7 +280,7 @@ export function getConvergenceKick(signal: ConvergenceSignal): string | undefine
 		// the immediate execution-start follow-up. Once either happens, repeated turn-end
 		// warnings are noise rather than useful convergence.
 		if (!signal.todoListId || !signal.allTodosPending || signal.executionKickSent) return undefined;
-		return `yuki plan-flow: plan approved. Begin execution now: call todo_write to mark the first step in_progress for list ${signal.todoListId}.`;
+		return `yuki plan-mode: plan approved. Begin execution now: call todo_write to mark the first step in_progress for list ${signal.todoListId}.`;
 	}
 	return undefined;
 }

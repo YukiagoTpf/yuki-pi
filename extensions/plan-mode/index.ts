@@ -13,7 +13,7 @@ export { PLAN_STATE_CUSTOM_TYPE };
 
 const PLAN_TOOLS = new Set(["plan_write"]);
 const MAX_REVIEW_REVISION_ATTEMPTS = 3;
-/** customType for one-line, display:false plan-flow continuation messages. */
+/** customType for one-line, display:false plan-mode continuation messages. */
 const PLAN_KICK_CUSTOM_TYPE = "yuki-plan-flow-kick";
 const PLAN_MODE_PROMPT_CUSTOM_TYPE = "yuki-plan-flow-mode-prompt";
 const PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE = "yuki-plan-flow-approval-preview";
@@ -162,7 +162,7 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 	const MAX_CONVERGENCE_KICKS = 3;
 
 	pi.registerCommand("plan", {
-		description: "Start yuki plan-flow for a requested change: /plan [--context <token>] <request>",
+		description: "Start yuki plan-mode for a requested change: /plan [--context <token>] <request>",
 		handler: async (args, ctx) => {
 			const parsed = parsePlanCommandArgs(args);
 			if (!parsed.request) {
@@ -193,7 +193,7 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("plan-abort", {
-		description: "Abort the active yuki plan-flow",
+		description: "Abort the active yuki plan-mode",
 		handler: async (args, ctx) => {
 			const state = reconstructPlanState(ctx);
 			if (!state?.active || state.phase === "aborted") {
@@ -206,7 +206,7 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("plan-status", {
-		description: "Show yuki plan-flow status",
+		description: "Show yuki plan-mode status",
 		handler: async (_args, ctx) => {
 			const state = reconstructPlanState(ctx);
 			if (!state?.active || state.phase === "aborted") {
@@ -219,7 +219,7 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("plan-debug", {
-		description: "Show yuki plan-flow phase, allowed tools, and next action (debug aid)",
+		description: "Show yuki plan-mode phase, allowed tools, and next action (debug aid)",
 		handler: async (_args, ctx) => {
 			const state = reconstructPlanState(ctx);
 			if (!state?.active || state.phase === "aborted") {
@@ -397,7 +397,7 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 		const count = (convergenceKicks.get(state.planId) ?? 0) + 1;
 		if (count > MAX_CONVERGENCE_KICKS) {
 			ctx.ui.notify(
-				`yuki plan-flow: stalled in ${state.phase} after ${MAX_CONVERGENCE_KICKS} continuation hints. Use /plan-debug, /plan-abort, or tell me to continue.`,
+				`yuki plan-mode: stalled in ${state.phase} after ${MAX_CONVERGENCE_KICKS} continuation hints. Use /plan-debug, /plan-abort, or tell me to continue.`,
 				"warning",
 			);
 			return;
@@ -450,7 +450,7 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 				try {
 					await driveUiApproval(pi, ctx, planId);
 				} catch (err) {
-					ctx.ui.notify?.(`yuki plan-flow: approval failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+					ctx.ui.notify?.(`yuki plan-mode: approval failed: ${err instanceof Error ? err.message : String(err)}`, "error");
 				} finally {
 					approvalInFlight = false;
 				}
@@ -508,7 +508,7 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 		description: "Write or revise the current yuki plan as structured steps. This writes branch-safe plan state and renders a draft file.",
 		promptSnippet: "Write or revise the yuki plan draft with structured steps, decisions, and assumptions.",
 		promptGuidelines: [
-			"Use plan_write only after read-only planning when a yuki plan-flow is active.",
+			"Use plan_write only after read-only planning when a yuki plan-mode is active.",
 			"plan_write is the source of truth for plan steps; do not create free-form plan markdown instead.",
 			"Each plan_write step must include content and activeForm, and should include validation when possible.",
 			"Include decisions and assumptions explicitly so the implementation has no unresolved branches.",
@@ -1235,7 +1235,7 @@ function publishRevisionLoopStop(pi: ExtensionAPI, state: PlanFlowState, issueTe
 			customType: PLAN_KICK_CUSTOM_TYPE,
 			display: true,
 			content: [
-				`Automatic review is still blocking plan ${state.planId} after ${state.reviewRevisionAttempts} attempt(s), so yuki plan-flow stopped the internal revision loop to avoid spinning.`,
+				`Automatic review is still blocking plan ${state.planId} after ${state.reviewRevisionAttempts} attempt(s), so yuki plan-mode stopped the internal revision loop to avoid spinning.`,
 				"Current blocking issues:",
 				issueText,
 				"",
@@ -1276,7 +1276,7 @@ function advancePhase(pi: ExtensionAPI, ctx: ExtensionContext, next: PlanFlowSta
 }
 
 /** rev.4 P1-1: programmatic entry point for callers like /ta-dev that want to start a
- * yuki plan-flow WITHOUT going through the `/plan` slash command.
+ * yuki plan-mode WITHOUT going through the `/plan` slash command.
  *
  * Background: `pi.sendUserMessage("/plan ...")` deliberately skips slash-command
  * handling (the runtime calls `prompt(text, { expandPromptTemplates: false })`), so a
@@ -1301,7 +1301,7 @@ export interface StartPlanFlowOptions {
 export async function startPlanFlow(pi: ExtensionAPI, ctx: ExtensionContext, opts: StartPlanFlowOptions): Promise<void> {
 	const request = opts.request.trim();
 	if (!request) {
-		ctx.ui.notify("yuki plan-flow: request is required.", "warning");
+		ctx.ui.notify("yuki plan-mode: request is required.", "warning");
 		return;
 	}
 	const existing = reconstructPlanState(ctx);
@@ -1312,7 +1312,7 @@ export async function startPlanFlow(pi: ExtensionAPI, ctx: ExtensionContext, opt
 
 	const approvalMode = opts.approvalMode;
 	if (!ctx.hasUI && approvalMode === "ui") {
-		ctx.ui.notify("yuki plan-flow: approvalMode 'ui' requires an interactive UI. Trusted headless callers must pass approvalMode:'auto'.", "warning");
+		ctx.ui.notify("yuki plan-mode: approvalMode 'ui' requires an interactive UI. Trusted headless callers must pass approvalMode:'auto'.", "warning");
 		return;
 	}
 
@@ -1349,7 +1349,7 @@ export async function startPlanFlow(pi: ExtensionAPI, ctx: ExtensionContext, opt
 	// point the agent is not streaming, so advancePhase's sendMessage(triggerTurn)
 	// starts a clean, narrowed planning turn with zero visible noise. The detailed
 	// planning instructions come from the context event mode prompt.
-	ctx.ui.notify(`yuki plan-flow started · phase: planning · plan ${state.planId}`, "info");
+	ctx.ui.notify(`yuki plan-mode started · phase: planning · plan ${state.planId}`, "info");
 	advancePhase(pi, ctx, state, buildKickoffContent(state), "plan_start");
 }
 
@@ -1368,9 +1368,9 @@ function buildBlockedToolReason(state: PlanFlowState, _toolName: string, allowed
 	if (attempts >= 2) {
 		// Short, direct, action-only. Repeating the long calm line verbatim read like a
 		// deadloop in the incident; escalate the wording instead of the pressure.
-		return `yuki plan-flow: call ${allowedList} next.`;
+		return `yuki plan-mode: call ${allowedList} next.`;
 	}
-	return `yuki plan-flow: in phase ${state.phase}, the next tool to call is: ${allowedList}.`;
+	return `yuki plan-mode: in phase ${state.phase}, the next tool to call is: ${allowedList}.`;
 }
 
 function nextActionHint(state: PlanFlowState): string {
@@ -1379,7 +1379,7 @@ function nextActionHint(state: PlanFlowState): string {
 	if (state.phase === "revising") return "Call plan_write with the revised plan.";
 	if (state.phase === "awaiting_approval") return state.approvalMode === "auto" ? "Wait; extension auto-approval is running." : "Use the approval dialog.";
 	if (state.phase === "executing") return `Use todo_read/todo_write on ${state.todoListId ?? "the plan-owned todo list"}.`;
-	return "Follow the yuki plan-flow phase prompt.";
+	return "Follow the yuki plan-mode phase prompt.";
 }
 
 /** A terminating "you called a plan tool in the wrong phase/state" result.
@@ -1390,7 +1390,7 @@ function nextActionHint(state: PlanFlowState): string {
  * active tool set is narrowed for the next real prompt. */
 function buildNoActivePlanResult(toolName: string): { content: Array<{ type: "text"; text: string }>; details: { active: false; phase: "idle" }; terminate: true } {
 	return {
-		content: [{ type: "text" as const, text: `yuki plan-flow: ${toolName} is not valid right now because there is no active plan. Normal/idle mode is active. Ending this turn; start a plan with /plan <request> before calling plan_write.` }],
+		content: [{ type: "text" as const, text: `yuki plan-mode: ${toolName} is not valid right now because there is no active plan. Normal/idle mode is active. Ending this turn; start a plan with /plan <request> before calling plan_write.` }],
 		details: { active: false, phase: "idle" },
 		terminate: true,
 	};
@@ -1399,8 +1399,8 @@ function buildNoActivePlanResult(toolName: string): { content: Array<{ type: "te
 function buildWrongPhaseResult(toolName: string, state: PlanFlowState, extra?: string): { content: Array<{ type: "text"; text: string }>; details: { state: PlanFlowState }; terminate: true } {
 	const hint = nextActionHint(state);
 	const text = extra
-		? `yuki plan-flow: ${toolName} is not valid right now (${extra}). ${hint} Ending this turn; the next turn will expose the correct tool.`
-		: `yuki plan-flow: ${toolName} is not valid in phase ${state.phase}. ${hint} Ending this turn; the next turn will expose the correct tool.`;
+		? `yuki plan-mode: ${toolName} is not valid right now (${extra}). ${hint} Ending this turn; the next turn will expose the correct tool.`
+		: `yuki plan-mode: ${toolName} is not valid in phase ${state.phase}. ${hint} Ending this turn; the next turn will expose the correct tool.`;
 	return {
 		content: [{ type: "text" as const, text }],
 		details: { state },
@@ -1431,7 +1431,7 @@ function buildPhasePrompt(state: PlanFlowState): string {
 	if (state.phase === "planning" || state.phase === "revising") {
 		const reviewText = state.phase === "revising" ? `\nAddress these review issues before plan_write:\n${formatReviewIssues(state)}` : "";
 		return [
-			`[YUKI PLAN FLOW: ${state.phase}]`,
+			`[YUKI PLAN MODE: ${state.phase}]`,
 			`Request: ${state.request}`,
 			"Read-only planning mode. Use read/grep/find/ls for repository facts.",
 			"Do not ask facts that can be inspected from the repo or runtime.",
@@ -1446,15 +1446,15 @@ function buildPhasePrompt(state: PlanFlowState): string {
 		].filter(Boolean).join("\n");
 	}
 	if (state.phase === "reviewing") {
-		return "[YUKI PLAN FLOW: reviewing]\nAutomatic review is running. Do not call tools unless the extension asks for a revised plan.";
+		return "[YUKI PLAN MODE: reviewing]\nAutomatic review is running. Do not call tools unless the extension asks for a revised plan.";
 	}
 	if (state.phase === "awaiting_approval") {
-		return "[YUKI PLAN FLOW: awaiting approval]\nApproval is extension/UI-owned. Do not call an approval tool.";
+		return "[YUKI PLAN MODE: awaiting approval]\nApproval is extension/UI-owned. Do not call an approval tool.";
 	}
 	if (state.phase === "executing") {
-		return `[YUKI PLAN FLOW: executing]\nThe plan is approved. Use todo_read/todo_write to track progress for list ${state.todoListId}. Keep at most one in_progress and provide evidence for completed items.`;
+		return `[YUKI PLAN MODE: executing]\nThe plan is approved. Use todo_read/todo_write to track progress for list ${state.todoListId}. Keep at most one in_progress and provide evidence for completed items.`;
 	}
-	return `[YUKI PLAN FLOW: ${state.phase}]\nFollow the yuki plan-flow phase prompt.`;
+	return `[YUKI PLAN MODE: ${state.phase}]\nFollow the yuki plan-mode phase prompt.`;
 }
 
 function formatPlanStatus(state: PlanFlowState): string {

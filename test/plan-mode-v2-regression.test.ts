@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-const source = readFileSync(new URL("../extensions/plan-flow/index.ts", import.meta.url), "utf8");
+const source = readFileSync(new URL("../extensions/plan-mode/index.ts", import.meta.url), "utf8");
 const compactionSource = readFileSync(new URL("../extensions/yuki-compaction.ts", import.meta.url), "utf8");
 
 function extractDrivePostReviewRevisingBranch(): string {
@@ -21,7 +21,7 @@ function extractHandler(eventName: string): string {
 	return source.slice(start, end);
 }
 
-describe("plan-flow v2 integration guards", () => {
+describe("plan-mode v2 integration guards", () => {
 	it("exposes only plan_write as the model-facing yuki mutating planning tool", () => {
 		assert.match(source, /const PLAN_TOOLS = new Set\(\["plan_write"\]\)/);
 		assert.match(source, /name: "plan_write"/);

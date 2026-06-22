@@ -92,11 +92,11 @@ export default function todoExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "todo_read",
 		label: "Todo Read",
-		description: "Read the current yuki-pi todo list. Works independently of plan-flow.",
+		description: "Read the current yuki-pi todo list. Works independently of plan-mode.",
 		promptSnippet: "Read the current yuki-pi todo list and progress.",
 		promptGuidelines: [
 			"Use todo_read to inspect yuki-pi todo progress before updating todos with todo_write.",
-			"todo_read works for standalone todos and for plan-owned todos created by plan-flow.",
+			"todo_read works for standalone todos and for plan-owned todos created by plan-mode.",
 		],
 		parameters: TodoReadParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
