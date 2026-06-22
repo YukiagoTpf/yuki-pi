@@ -322,14 +322,23 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 		const messages = event.messages.filter((message) => !(message.role === "custom" && (message.customType === PLAN_MODE_PROMPT_CUSTOM_TYPE || message.customType === PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE)));
 		const state = reconstructPlanState(ctx);
 		const activeState = state?.active && state.phase !== "aborted" && state.phase !== "completed" ? state : undefined;
-		const status = buildPlanModeStatus(activeState, pi.getActiveTools());
-		messages.push({
-			role: "custom",
-			customType: PLAN_MODE_PROMPT_CUSTOM_TYPE,
-			content: buildPlanModePrompt(activeState, status),
-			display: false,
-			timestamp: Date.now(),
-		});
+		// Idle (no active plan): skip injecting the plan-mode banner entirely. The tool
+		// surface is already narrowed by applyIdleTools() in the input hook (plan_write is
+		// unreachable), and the "/plan starts planning" fact is a static rule that belongs
+		// in the system prompt, not a per-turn banner. Not injecting means there is nothing
+		// for the model to echo back, so idle plan-mode becomes invisible and noise-free
+		// without relying on a do-not-echo prompt constraint. Only active plans need phase
+		// guidance injected per turn.
+		if (activeState) {
+			const status = buildPlanModeStatus(activeState, pi.getActiveTools());
+			messages.push({
+				role: "custom",
+				customType: PLAN_MODE_PROMPT_CUSTOM_TYPE,
+				content: buildPlanModePrompt(activeState, status),
+				display: false,
+				timestamp: Date.now(),
+			});
+		}
 		return { messages };
 	});
 

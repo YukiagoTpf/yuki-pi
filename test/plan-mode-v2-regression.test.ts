@@ -40,6 +40,10 @@ describe("plan-mode v2 integration guards", () => {
 		assert.match(source, /Internal routing metadata: do not echo this banner/);
 		assert.match(source, /do not echo this banner or restate plan mode\/idle\/active-plan status/);
 		assert.doesNotMatch(source, /Disabled plan tools/);
+		// P3+: idle (no active plan) must NOT inject the banner at all — skip injection so
+		// there is nothing to echo, instead of relying on a do-not-echo constraint.
+		assert.match(source, /Idle \(no active plan\): skip injecting the plan-mode banner entirely/);
+		assert.match(source, /if \(activeState\) \{[\s\S]*PLAN_MODE_PROMPT_CUSTOM_TYPE/);
 		const beforeAgentStart = extractHandler("before_agent_start");
 		assert.match(beforeAgentStart, /applyActiveTools\(pi, state\)/);
 		assert.match(beforeAgentStart, /updatePlanUi\(ctx, state\)/);
