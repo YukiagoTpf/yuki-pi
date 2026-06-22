@@ -34,7 +34,8 @@ describe("plan-mode v2 integration guards", () => {
 		assert.match(source, /pi\.on\("context"/);
 		assert.match(source, /PLAN_MODE_PROMPT_CUSTOM_TYPE/);
 		assert.match(source, /buildPlanModePrompt\(activeState, status\)/);
-		assert.match(source, /Normal\/idle mode: do not call plan_write/);
+		assert.match(source, /Normal\/idle mode: continue normal assistance/);
+		assert.doesNotMatch(source, /Disabled plan tools/);
 		const beforeAgentStart = extractHandler("before_agent_start");
 		assert.match(beforeAgentStart, /applyActiveTools\(pi, state\)/);
 		assert.match(beforeAgentStart, /updatePlanUi\(ctx, state\)/);
@@ -62,7 +63,7 @@ describe("plan-mode v2 integration guards", () => {
 	it("registers get_plan_mode_status as the read-only status protocol tool", () => {
 		assert.match(source, /name: PLAN_STATUS_TOOL/);
 		assert.match(source, /buildPlanModeStatus\(state, pi\.getActiveTools\(\)\)/);
-		assert.match(source, /If it reports idle, do not call plan_write/);
+		assert.match(source, /If it reports idle, continue normal assistance/);
 	});
 
 	it("keeps plan_write unblocked and persists successful draft state", () => {

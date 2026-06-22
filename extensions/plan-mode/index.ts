@@ -13,6 +13,8 @@ export { PLAN_STATE_CUSTOM_TYPE };
 
 const PLAN_TOOLS = new Set(["plan_write"]);
 const MAX_REVIEW_REVISION_ATTEMPTS = 3;
+// Keep historical yuki-plan-flow-* customTypes for persisted session compatibility.
+// Rename only after a dual-read/dual-write migration for existing histories.
 /** customType for one-line, display:false plan-mode continuation messages. */
 const PLAN_KICK_CUSTOM_TYPE = "yuki-plan-flow-kick";
 const PLAN_MODE_PROMPT_CUSTOM_TYPE = "yuki-plan-flow-mode-prompt";
@@ -481,7 +483,7 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 		promptSnippet: "Read the current yuki plan-mode status before deciding whether plan_write is available.",
 		promptGuidelines: [
 			"Use get_plan_mode_status when unsure whether a yuki plan is active.",
-			"If it reports idle, do not call plan_write; the user must start /plan <request> first.",
+			"If it reports idle, continue normal assistance; only the user can start planning with /plan <request>.",
 		],
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
@@ -1390,7 +1392,7 @@ function nextActionHint(state: PlanFlowState): string {
  * active tool set is narrowed for the next real prompt. */
 function buildNoActivePlanResult(toolName: string): { content: Array<{ type: "text"; text: string }>; details: { active: false; phase: "idle" }; terminate: true } {
 	return {
-		content: [{ type: "text" as const, text: `yuki plan-mode: ${toolName} is not valid right now because there is no active plan. Normal/idle mode is active. Ending this turn; start a plan with /plan <request> before calling plan_write.` }],
+		content: [{ type: "text" as const, text: `yuki plan-mode: ${toolName} is not valid right now because there is no active plan. Normal/idle mode is active. Ending this turn; only the user can start planning with /plan <request>.` }],
 		details: { active: false, phase: "idle" },
 		terminate: true,
 	};
@@ -1410,18 +1412,16 @@ function buildWrongPhaseResult(toolName: string, state: PlanFlowState, extra?: s
 
 function buildPlanModePrompt(state: PlanFlowState | undefined, status: ReturnType<typeof buildPlanModeStatus>): string {
 	const available = status.availablePlanTools.length > 0 ? status.availablePlanTools.join(", ") : "none";
-	const disabled = status.availablePlanTools.includes("plan_write") ? "none" : "plan_write";
 	const header = [
 		`[YUKI PLAN MODE: ${status.mode}]`,
 		`Active plan: ${status.active ? "yes" : "no"}`,
 		`Available plan tools: ${available}. Always available for self-check: ${PLAN_STATUS_TOOL}.`,
-		`Disabled plan tools: ${disabled}.`,
 		status.guidance,
 	];
 	if (!state) {
 		return [
 			...header,
-			"Normal/idle mode: do not call plan_write. To plan a task, the user must start /plan <request>.",
+			"Normal/idle mode: continue normal assistance. Only the user can start planning with /plan <request>.",
 		].join("\n");
 	}
 	return [...header, "", buildPhasePrompt(state)].join("\n");

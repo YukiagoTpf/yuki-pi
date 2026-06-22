@@ -126,7 +126,7 @@ describe("getAllowedToolsForState", () => {
 			title: undefined,
 			stepCount: undefined,
 			availablePlanTools: [],
-			guidance: "No active yuki plan. Start /plan <request> before calling plan_write.",
+			guidance: "No active yuki plan. To plan a task, the user must start /plan <request>.",
 		});
 		assert.deepEqual(buildPlanModeStatus({ active: true, phase: "planning", planId: "plan-1", title: "T", steps: [{}, {}], previousActiveTools: ["read"] }, ["read"]), {
 			active: true,
