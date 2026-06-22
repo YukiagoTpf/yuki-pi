@@ -278,13 +278,12 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 	pi.on("context", async (event, ctx) => {
 		const messages = event.messages.filter((message) => !(message.role === "custom" && (message.customType === PLAN_MODE_PROMPT_CUSTOM_TYPE || message.customType === PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE)));
 		const state = reconstructPlanState(ctx);
-		if (!state?.active || state.phase === "aborted" || state.phase === "completed") {
-			return messages.length === event.messages.length ? undefined : { messages };
-		}
+		const activeState = state?.active && state.phase !== "aborted" && state.phase !== "completed" ? state : undefined;
+		const status = buildPlanModeStatus(activeState, pi.getActiveTools());
 		messages.push({
 			role: "custom",
 			customType: PLAN_MODE_PROMPT_CUSTOM_TYPE,
-			content: buildPhasePrompt(state),
+			content: buildPlanModePrompt(activeState, status),
 			display: false,
 			timestamp: Date.now(),
 		});
@@ -1312,6 +1311,25 @@ function buildWrongPhaseResult(toolName: string, state: PlanFlowState, extra?: s
 		details: { state },
 		terminate: true,
 	};
+}
+
+function buildPlanModePrompt(state: PlanFlowState | undefined, status: ReturnType<typeof buildPlanModeStatus>): string {
+	const available = status.availablePlanTools.length > 0 ? status.availablePlanTools.join(", ") : "none";
+	const disabled = status.availablePlanTools.includes("plan_write") ? "none" : "plan_write";
+	const header = [
+		`[YUKI PLAN MODE: ${status.mode}]`,
+		`Active plan: ${status.active ? "yes" : "no"}`,
+		`Available plan tools: ${available}. Always available for self-check: ${PLAN_STATUS_TOOL}.`,
+		`Disabled plan tools: ${disabled}.`,
+		status.guidance,
+	];
+	if (!state) {
+		return [
+			...header,
+			"Normal/idle mode: do not call plan_write. To plan a task, the user must start /plan <request>.",
+		].join("\n");
+	}
+	return [...header, "", buildPhasePrompt(state)].join("\n");
 }
 
 function buildPhasePrompt(state: PlanFlowState): string {

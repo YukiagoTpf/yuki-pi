@@ -33,6 +33,8 @@ describe("plan-flow v2 integration guards", () => {
 	it("injects plan-mode policy through context and only uses before_agent_start for tool refresh", () => {
 		assert.match(source, /pi\.on\("context"/);
 		assert.match(source, /PLAN_MODE_PROMPT_CUSTOM_TYPE/);
+		assert.match(source, /buildPlanModePrompt\(activeState, status\)/);
+		assert.match(source, /Normal\/idle mode: do not call plan_write/);
 		const beforeAgentStart = extractHandler("before_agent_start");
 		assert.match(beforeAgentStart, /applyActiveTools\(pi, state\)/);
 		assert.match(beforeAgentStart, /updatePlanUi\(ctx, state\)/);
