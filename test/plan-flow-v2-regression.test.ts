@@ -41,6 +41,12 @@ describe("plan-flow v2 integration guards", () => {
 		assert.doesNotMatch(beforeAgentStart, /PLAN_MODE_PROMPT_CUSTOM_TYPE/);
 	});
 
+	it("steers plan_write payloads to stay within an output budget", () => {
+		assert.match(source, /PLAN_WRITE_BUDGET_GUIDANCE/);
+		assert.match(source, /40%-60%/);
+		assert.match(source, /validation <= 2 items per step/);
+	});
+
 	it("registers get_plan_mode_status as the read-only status protocol tool", () => {
 		assert.match(source, /name: PLAN_STATUS_TOOL/);
 		assert.match(source, /buildPlanModeStatus\(state, pi\.getActiveTools\(\)\)/);

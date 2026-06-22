@@ -17,6 +17,7 @@ const MAX_REVIEW_REVISION_ATTEMPTS = 3;
 const PLAN_KICK_CUSTOM_TYPE = "yuki-plan-flow-kick";
 const PLAN_MODE_PROMPT_CUSTOM_TYPE = "yuki-plan-flow-mode-prompt";
 const PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE = "yuki-plan-flow-approval-preview";
+const PLAN_WRITE_BUDGET_GUIDANCE = "Keep each plan_write call well below the model max output tokens (initial heuristic: 40%-60%). If the plan is large, first send a skeleton or concise stage-level plan: background 5-8 core lines, decisions short, each step a stage, validation <= 2 items per step.";
 
 type Phase = "idle" | "planning" | "reviewing" | "revising" | "awaiting_approval" | "executing" | "completed" | "aborted";
 type ApprovalMode = "ui" | "auto";
@@ -506,6 +507,7 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			"plan_write is the source of truth for plan steps; do not create free-form plan markdown instead.",
 			"Each plan_write step must include content and activeForm, and should include validation when possible.",
 			"Include decisions and assumptions explicitly so the implementation has no unresolved branches.",
+			PLAN_WRITE_BUDGET_GUIDANCE,
 		],
 		parameters: PlanWriteParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1344,6 +1346,7 @@ function buildPhasePrompt(state: PlanFlowState): string {
 			"If ambiguity is low-risk, proceed with an explicit assumption and record it in plan_write.assumptions.",
 			"Call plan_write only when the plan is decision-complete enough for another agent to execute.",
 			"plan_write must include files/rationale/validation where relevant, plus decisions and assumptions.",
+			PLAN_WRITE_BUDGET_GUIDANCE,
 			renderPlanningContextGuidance(state),
 			reviewText,
 		].filter(Boolean).join("\n");
