@@ -17,6 +17,11 @@ export default function yukiTurnDurationExtension(pi: ExtensionAPI) {
 	let startedAt: number | undefined;
 	let turnCount = 0;
 
+	// Live working-message timer (TUI only). Appends elapsed time to the "Working..." row
+	// shown above the input while the agent is running.
+	let workingTimer: ReturnType<typeof setInterval> | undefined;
+	let workingCtx: ExtensionContext | undefined;
+
 	pi.registerMessageRenderer<DurationDetails>(CUSTOM_TYPE, (message, _options, theme) => {
 		const text = typeof message.content === "string" ? message.content : formatDurationLine(message.details?.elapsedMs ?? 0);
 		return new Text(theme.fg("dim", text), 1, 0);
@@ -27,18 +32,44 @@ export default function yukiTurnDurationExtension(pi: ExtensionAPI) {
 		messages: event.messages.filter((message) => !isDurationMessage(message)),
 	}));
 
-	pi.on("agent_start", () => {
+	const renderWorking = () => {
+		const ctx = workingCtx;
+		if (!ctx) return;
+		const elapsedMs = Math.max(0, Date.now() - (startedAt ?? Date.now()));
+		ctx.ui.setWorkingMessage(`Working... ${formatDuration(elapsedMs)} · turn ${turnCount}`);
+	};
+
+	const stopWorkingTimer = (ctx: ExtensionContext) => {
+		if (workingTimer) {
+			clearInterval(workingTimer);
+			workingTimer = undefined;
+		}
+		workingCtx = undefined;
+		ctx.ui.setWorkingMessage(); // restore pi's default working message
+	};
+
+	pi.on("agent_start", (_event, ctx) => {
 		startedAt = Date.now();
 		turnCount = 0;
+
+		if (ctx.mode !== "tui") return;
+
+		workingCtx = ctx;
+		renderWorking();
+
+		// Refresh the working message once per second while streaming/working.
+		workingTimer = setInterval(renderWorking, 1000);
+		workingTimer.unref?.();
 	});
 
 	pi.on("turn_end", () => {
 		turnCount += 1;
+		renderWorking();
 	});
 
 	pi.on("agent_end", (event, ctx) => {
 		if (ctx.mode !== "tui") return;
-		if ((event as { willRetry?: boolean }).willRetry) return;
+		if ((event as { willRetry?: boolean }).willRetry) return; // keep the live timer running across retries
 
 		const endedAt = Date.now();
 		const actualStartedAt = startedAt ?? endedAt;
@@ -50,6 +81,7 @@ export default function yukiTurnDurationExtension(pi: ExtensionAPI) {
 			turnCount,
 		};
 
+		stopWorkingTimer(ctx);
 		startedAt = undefined;
 		turnCount = 0;
 		sendWhenIdle(pi, ctx, formatDurationLine(elapsedMs), details);
