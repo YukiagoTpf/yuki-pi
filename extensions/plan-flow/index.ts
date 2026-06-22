@@ -7,7 +7,7 @@ import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { createTodoState, makeTodoStateRecord, reconstructTodoStates } from "../todo/index.ts";
 import { PLAN_STATE_CUSTOM_TYPE, TODO_STATE_CUSTOM_TYPE } from "../shared/constants.ts";
-import { checkMandatoryValidation, derivePlanModeSurface, getAllowedToolsForState as getAllowedToolsForPhase, getConvergenceKick, parsePlanCommandArgs, stripPlanMutatingTools, slugify } from "../shared/plan-helpers.ts";
+import { buildPlanModeStatus, checkMandatoryValidation, derivePlanModeSurface, getAllowedToolsForState as getAllowedToolsForPhase, getConvergenceKick, parsePlanCommandArgs, PLAN_STATUS_TOOL, stripPlanMutatingTools, slugify } from "../shared/plan-helpers.ts";
 
 export { PLAN_STATE_CUSTOM_TYPE };
 
@@ -467,6 +467,34 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 		if (todoState.todos.every((todo) => todo.status === "completed")) {
 			await closePlan(pi, ctx, state);
 		}
+	});
+
+	pi.registerTool({
+		name: PLAN_STATUS_TOOL,
+		label: "Plan Mode Status",
+		description: "Read the current yuki plan-mode status and available plan tools.",
+		promptSnippet: "Read the current yuki plan-mode status before deciding whether plan_write is available.",
+		promptGuidelines: [
+			"Use get_plan_mode_status when unsure whether a yuki plan is active.",
+			"If it reports idle, do not call plan_write; the user must start /plan <request> first.",
+		],
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			const state = reconstructPlanState(ctx);
+			const status = buildPlanModeStatus(state, pi.getActiveTools());
+			return {
+				content: [{ type: "text" as const, text: JSON.stringify(status) }],
+				details: { status },
+			};
+		},
+		renderCall(_args, theme) {
+			return new Text(theme.fg("toolTitle", theme.bold("get_plan_mode_status")), 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const status = (result.details as { status?: ReturnType<typeof buildPlanModeStatus> } | undefined)?.status;
+			if (!status) return new Text(textContent(result), 0, 0);
+			return new Text(theme.fg("success", "✓ plan mode ") + theme.fg("muted", `${status.mode} · tools=${status.availablePlanTools.join(",") || "none"}`), 0, 0);
+		},
 	});
 
 	pi.registerTool({

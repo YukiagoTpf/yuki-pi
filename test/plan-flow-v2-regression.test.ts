@@ -22,7 +22,7 @@ function extractHandler(eventName: string): string {
 }
 
 describe("plan-flow v2 integration guards", () => {
-	it("exposes only plan_write as the model-facing yuki planning tool", () => {
+	it("exposes only plan_write as the model-facing yuki mutating planning tool", () => {
 		assert.match(source, /const PLAN_TOOLS = new Set\(\["plan_write"\]\)/);
 		assert.match(source, /name: "plan_write"/);
 		for (const removed of ["grill_plan", "grill_done", "plan_ask", "plan_exit"]) {
@@ -37,6 +37,12 @@ describe("plan-flow v2 integration guards", () => {
 		assert.match(beforeAgentStart, /applyActiveTools\(pi, state\)/);
 		assert.match(beforeAgentStart, /updatePlanUi\(ctx, state\)/);
 		assert.doesNotMatch(beforeAgentStart, /PLAN_MODE_PROMPT_CUSTOM_TYPE/);
+	});
+
+	it("registers get_plan_mode_status as the read-only status protocol tool", () => {
+		assert.match(source, /name: PLAN_STATUS_TOOL/);
+		assert.match(source, /buildPlanModeStatus\(state, pi\.getActiveTools\(\)\)/);
+		assert.match(source, /If it reports idle, do not call plan_write/);
 	});
 
 	it("returns a terminating result for stale plan_write calls with no active plan", () => {

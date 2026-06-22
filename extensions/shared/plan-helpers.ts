@@ -115,6 +115,7 @@ export const ASK_USER_TOOL = "ask_user_question";
 export const TODO_TOOLS = ["todo_read", "todo_write"];
 
 export const PLAN_MUTATING_TOOLS = new Set(["plan_write"]);
+export const PLAN_STATUS_TOOL = "get_plan_mode_status";
 
 export type PlanModePhase = "idle" | "planning" | "reviewing" | "revising" | "awaiting_approval" | "executing" | "completed" | "aborted";
 
@@ -122,11 +123,25 @@ export interface PlanModeStateLike {
 	active?: boolean;
 	phase?: string;
 	previousActiveTools?: string[];
+	planId?: string;
+	title?: string;
+	steps?: unknown[];
 }
 
 export interface PlanModeSurface {
 	mode: PlanModePhase;
 	allowedTools: string[];
+	availablePlanTools: string[];
+	guidance: string;
+}
+
+export interface PlanModeStatus {
+	active: boolean;
+	mode: PlanModePhase;
+	phase: PlanModePhase;
+	planId?: string;
+	title?: string;
+	stepCount?: number;
 	availablePlanTools: string[];
 	guidance: string;
 }
@@ -159,6 +174,7 @@ export function getAllowedToolsForState(
 	currentActiveTools: string[] = previousActiveTools,
 ): string[] {
 	const base = new Set<string>();
+	base.add(PLAN_STATUS_TOOL);
 	if (phase === "planning" || phase === "revising") {
 		for (const tool of previousActiveTools) if (READ_ONLY_TOOLS.has(tool) || tool === ASK_USER_TOOL) base.add(tool);
 		base.add("plan_write");
@@ -185,6 +201,21 @@ export function derivePlanModeSurface(state: PlanModeStateLike | undefined, curr
 		guidance: mode === "idle"
 			? "No active yuki plan. Start /plan <request> before calling plan_write."
 			: `Yuki plan mode is ${mode}.`,
+	};
+}
+
+export function buildPlanModeStatus(state: PlanModeStateLike | undefined, currentActiveTools: string[] = []): PlanModeStatus {
+	const surface = derivePlanModeSurface(state, currentActiveTools);
+	const active = Boolean(state?.active && surface.mode !== "idle" && surface.mode !== "completed" && surface.mode !== "aborted");
+	return {
+		active,
+		mode: surface.mode,
+		phase: surface.mode,
+		planId: active ? state?.planId : undefined,
+		title: active ? state?.title : undefined,
+		stepCount: active && Array.isArray(state?.steps) ? state.steps.length : undefined,
+		availablePlanTools: surface.availablePlanTools,
+		guidance: surface.guidance,
 	};
 }
 

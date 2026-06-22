@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { checkMandatoryValidation, derivePlanModeSurface, getAllowedToolsForState, getConvergenceKick, isExecutableResolution, parsePlanCommandArgs, slugify, stripPlanMutatingTools } from "../extensions/shared/plan-helpers.ts";
+import { buildPlanModeStatus, checkMandatoryValidation, derivePlanModeSurface, getAllowedToolsForState, getConvergenceKick, isExecutableResolution, parsePlanCommandArgs, PLAN_STATUS_TOOL, slugify, stripPlanMutatingTools } from "../extensions/shared/plan-helpers.ts";
 
 describe("isExecutableResolution", () => {
 	it("accepts short but concrete answers", () => {
@@ -82,39 +82,62 @@ describe("getAllowedToolsForState", () => {
 	const previous = ["read", "grep", "bash", "edit", "todo_read", "ask_user_question"];
 
 	it("allows read/search, generic ask, and plan_write during planning", () => {
-		assert.deepEqual(getAllowedToolsForState("planning", previous), ["read", "grep", "ask_user_question", "plan_write"]);
+		assert.deepEqual(getAllowedToolsForState("planning", previous), [PLAN_STATUS_TOOL, "read", "grep", "ask_user_question", "plan_write"]);
 	});
 
 	it("narrows revising to the same stable planning surface", () => {
-		assert.deepEqual(getAllowedToolsForState("revising", previous), ["read", "grep", "ask_user_question", "plan_write"]);
+		assert.deepEqual(getAllowedToolsForState("revising", previous), [PLAN_STATUS_TOOL, "read", "grep", "ask_user_question", "plan_write"]);
 	});
 
 	it("allows no model tools while automatic review or approval is extension-owned", () => {
-		assert.deepEqual(getAllowedToolsForState("reviewing", previous), []);
-		assert.deepEqual(getAllowedToolsForState("awaiting_approval", previous), []);
+		assert.deepEqual(getAllowedToolsForState("reviewing", previous), [PLAN_STATUS_TOOL]);
+		assert.deepEqual(getAllowedToolsForState("awaiting_approval", previous), [PLAN_STATUS_TOOL]);
 	});
 
 	it("restores sanitized ambient tools plus todo tools while executing", () => {
-		assert.deepEqual(getAllowedToolsForState("executing", ["read", "edit", "plan_write"]), ["read", "edit", "todo_read", "todo_write"]);
+		assert.deepEqual(getAllowedToolsForState("executing", ["read", "edit", "plan_write"]), [PLAN_STATUS_TOOL, "read", "edit", "todo_read", "todo_write"]);
 	});
 
 	it("falls back to current tools for executing when no ambient snapshot exists", () => {
-		assert.deepEqual(getAllowedToolsForState("executing", [], ["read", "bash", "plan_write"]), ["read", "bash", "todo_read", "todo_write"]);
+		assert.deepEqual(getAllowedToolsForState("executing", [], ["read", "bash", "plan_write"]), [PLAN_STATUS_TOOL, "read", "bash", "todo_read", "todo_write"]);
 	});
 
 	it("strips plan mutating tools from completed, aborted, idle, and unknown current surfaces", () => {
 		for (const phase of ["completed", "aborted", "idle", "unknown"]) {
-			assert.deepEqual(getAllowedToolsForState(phase, ["read"], ["read", "edit", "plan_write"]), ["read", "edit"]);
+			assert.deepEqual(getAllowedToolsForState(phase, ["read"], ["read", "edit", "plan_write"]), [PLAN_STATUS_TOOL, "read", "edit"]);
 		}
 	});
 
 	it("derives idle from current tools and executing from sanitized ambient tools", () => {
 		assert.deepEqual(stripPlanMutatingTools(["read", "plan_write", "grep"]), ["read", "grep"]);
-		assert.deepEqual(derivePlanModeSurface(undefined, ["read", "grep", "plan_write"]).allowedTools, ["read", "grep"]);
+		assert.deepEqual(derivePlanModeSurface(undefined, ["read", "grep", "plan_write"]).allowedTools, [PLAN_STATUS_TOOL, "read", "grep"]);
 		assert.deepEqual(
 			derivePlanModeSurface({ active: true, phase: "executing", previousActiveTools: ["read", "edit", "plan_write"] }, ["todo_read"]).allowedTools,
-			["read", "edit", "todo_read", "todo_write"],
+			[PLAN_STATUS_TOOL, "read", "edit", "todo_read", "todo_write"],
 		);
+	});
+
+	it("builds a stable plan-mode status protocol", () => {
+		assert.deepEqual(buildPlanModeStatus(undefined, ["read", "plan_write"]), {
+			active: false,
+			mode: "idle",
+			phase: "idle",
+			planId: undefined,
+			title: undefined,
+			stepCount: undefined,
+			availablePlanTools: [],
+			guidance: "No active yuki plan. Start /plan <request> before calling plan_write.",
+		});
+		assert.deepEqual(buildPlanModeStatus({ active: true, phase: "planning", planId: "plan-1", title: "T", steps: [{}, {}], previousActiveTools: ["read"] }, ["read"]), {
+			active: true,
+			mode: "planning",
+			phase: "planning",
+			planId: "plan-1",
+			title: "T",
+			stepCount: 2,
+			availablePlanTools: ["plan_write"],
+			guidance: "Yuki plan mode is planning.",
+		});
 	});
 });
 
