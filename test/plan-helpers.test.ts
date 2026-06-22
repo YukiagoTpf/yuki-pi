@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { checkMandatoryValidation, getAllowedToolsForState, getConvergenceKick, isExecutableResolution, parsePlanCommandArgs, slugify } from "../extensions/shared/plan-helpers.ts";
+import { checkMandatoryValidation, derivePlanModeSurface, getAllowedToolsForState, getConvergenceKick, isExecutableResolution, parsePlanCommandArgs, slugify, stripPlanMutatingTools } from "../extensions/shared/plan-helpers.ts";
 
 describe("isExecutableResolution", () => {
 	it("accepts short but concrete answers", () => {
@@ -94,14 +94,27 @@ describe("getAllowedToolsForState", () => {
 		assert.deepEqual(getAllowedToolsForState("awaiting_approval", previous), []);
 	});
 
-	it("restores previous tools plus todo tools while executing", () => {
-		assert.deepEqual(getAllowedToolsForState("executing", ["read", "edit"]), ["read", "edit", "todo_read", "todo_write"]);
+	it("restores sanitized ambient tools plus todo tools while executing", () => {
+		assert.deepEqual(getAllowedToolsForState("executing", ["read", "edit", "plan_write"]), ["read", "edit", "todo_read", "todo_write"]);
 	});
 
-	it("restores previous tools for completed, aborted, idle, and unknown phases", () => {
+	it("falls back to current tools for executing when no ambient snapshot exists", () => {
+		assert.deepEqual(getAllowedToolsForState("executing", [], ["read", "bash", "plan_write"]), ["read", "bash", "todo_read", "todo_write"]);
+	});
+
+	it("strips plan mutating tools from completed, aborted, idle, and unknown current surfaces", () => {
 		for (const phase of ["completed", "aborted", "idle", "unknown"]) {
-			assert.deepEqual(getAllowedToolsForState(phase, ["read", "edit"]), ["read", "edit"]);
+			assert.deepEqual(getAllowedToolsForState(phase, ["read"], ["read", "edit", "plan_write"]), ["read", "edit"]);
 		}
+	});
+
+	it("derives idle from current tools and executing from sanitized ambient tools", () => {
+		assert.deepEqual(stripPlanMutatingTools(["read", "plan_write", "grep"]), ["read", "grep"]);
+		assert.deepEqual(derivePlanModeSurface(undefined, ["read", "grep", "plan_write"]).allowedTools, ["read", "grep"]);
+		assert.deepEqual(
+			derivePlanModeSurface({ active: true, phase: "executing", previousActiveTools: ["read", "edit", "plan_write"] }, ["todo_read"]).allowedTools,
+			["read", "edit", "todo_read", "todo_write"],
+		);
 	});
 });
 

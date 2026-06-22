@@ -114,16 +114,49 @@ export const ASK_USER_TOOL = "ask_user_question";
 /** Todo tools always permitted during executing. */
 export const TODO_TOOLS = ["todo_read", "todo_write"];
 
+export const PLAN_MUTATING_TOOLS = new Set(["plan_write"]);
+
+export type PlanModePhase = "idle" | "planning" | "reviewing" | "revising" | "awaiting_approval" | "executing" | "completed" | "aborted";
+
+export interface PlanModeStateLike {
+	active?: boolean;
+	phase?: string;
+	previousActiveTools?: string[];
+}
+
+export interface PlanModeSurface {
+	mode: PlanModePhase;
+	allowedTools: string[];
+	availablePlanTools: string[];
+	guidance: string;
+}
+
+export function stripPlanMutatingTools(tools: string[] = []): string[] {
+	return tools.filter((tool) => !PLAN_MUTATING_TOOLS.has(tool));
+}
+
+function normalizePlanMode(state?: PlanModeStateLike): PlanModePhase {
+	if (!state?.active) return "idle";
+	if (state.phase === "planning" || state.phase === "reviewing" || state.phase === "revising" || state.phase === "awaiting_approval" || state.phase === "executing" || state.phase === "completed" || state.phase === "aborted") {
+		return state.phase;
+	}
+	return "idle";
+}
+
 /**
  * Compute the allowed tool set for a plan-flow phase.
  *
  * Planning/revising expose one stable model-facing plan tool (`plan_write`) plus
  * repository read/search tools. Approval/review are extension-owned and expose no
- * model tools. Execution restores the caller's normal surface plus todo tools.
+ * model tools. Execution restores the caller's normal surface plus todo tools after
+ * removing plan mutating tools from the ambient surface. Idle/terminal states only
+ * remove plan mutating tools from the current surface, so other extensions keep
+ * ownership of tools they dynamically add.
  */
 export function getAllowedToolsForState(
 	phase: string,
 	previousActiveTools: string[] = [],
+	currentActiveTools: string[] = previousActiveTools,
 ): string[] {
 	const base = new Set<string>();
 	if (phase === "planning" || phase === "revising") {
@@ -132,13 +165,27 @@ export function getAllowedToolsForState(
 	} else if (phase === "reviewing" || phase === "awaiting_approval") {
 		// Automatic review and approval are extension/UI-owned.
 	} else if (phase === "executing") {
-		for (const tool of previousActiveTools) base.add(tool);
+		for (const tool of stripPlanMutatingTools(previousActiveTools.length > 0 ? previousActiveTools : currentActiveTools)) base.add(tool);
 		for (const tool of TODO_TOOLS) base.add(tool);
 	} else {
-		// idle / completed / aborted / unknown → restore the user's tool set.
-		for (const tool of previousActiveTools) base.add(tool);
+		// idle / completed / aborted / unknown → keep the current surface, minus plan mutators.
+		for (const tool of stripPlanMutatingTools(currentActiveTools)) base.add(tool);
 	}
 	return [...base];
+}
+
+export function derivePlanModeSurface(state: PlanModeStateLike | undefined, currentActiveTools: string[] = []): PlanModeSurface {
+	const mode = normalizePlanMode(state);
+	const allowedTools = getAllowedToolsForState(mode, state?.previousActiveTools ?? [], currentActiveTools);
+	const availablePlanTools = allowedTools.filter((tool) => PLAN_MUTATING_TOOLS.has(tool));
+	return {
+		mode,
+		allowedTools,
+		availablePlanTools,
+		guidance: mode === "idle"
+			? "No active yuki plan. Start /plan <request> before calling plan_write."
+			: `Yuki plan mode is ${mode}.`,
+	};
 }
 
 /**

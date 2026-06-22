@@ -7,7 +7,7 @@ import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { createTodoState, makeTodoStateRecord, reconstructTodoStates } from "../todo/index.ts";
 import { PLAN_STATE_CUSTOM_TYPE, TODO_STATE_CUSTOM_TYPE } from "../shared/constants.ts";
-import { checkMandatoryValidation, getAllowedToolsForState as getAllowedToolsForPhase, getConvergenceKick, parsePlanCommandArgs, slugify } from "../shared/plan-helpers.ts";
+import { checkMandatoryValidation, derivePlanModeSurface, getAllowedToolsForState as getAllowedToolsForPhase, getConvergenceKick, parsePlanCommandArgs, stripPlanMutatingTools, slugify } from "../shared/plan-helpers.ts";
 
 export { PLAN_STATE_CUSTOM_TYPE };
 
@@ -228,10 +228,12 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		const state = reconstructPlanState(ctx);
-		if (state?.active && state.phase !== "aborted") {
+		if (state?.active && state.phase !== "aborted" && state.phase !== "completed") {
 			applyActiveTools(pi, state);
 			updatePlanUi(ctx, state);
+			return;
 		}
+		applyIdleTools(pi);
 	});
 
 	pi.on("session_before_compact", async (_event, ctx) => {
@@ -250,10 +252,11 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 
 	pi.on("session_tree", async (_event, ctx) => {
 		const state = reconstructPlanState(ctx);
-		if (state?.active && state.phase !== "aborted") {
+		if (state?.active && state.phase !== "aborted" && state.phase !== "completed") {
 			applyActiveTools(pi, state);
 			updatePlanUi(ctx, state);
 		} else {
+			applyIdleTools(pi);
 			ctx.ui.setStatus("yuki-plan", undefined);
 			ctx.ui.setWidget("yuki-plan", undefined);
 		}
@@ -261,7 +264,10 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (_event, ctx) => {
 		const state = reconstructPlanState(ctx);
-		if (!state?.active || state.phase === "aborted" || state.phase === "completed") return;
+		if (!state?.active || state.phase === "aborted" || state.phase === "completed") {
+			applyIdleTools(pi);
+			return;
+		}
 		// Last-chance tool refresh: input handlers can transition state, and queued
 		// extension follow-ups can be prepared before the prompt/tool surface catches up.
 		// Re-applying here guarantees the next model call sees the durable plan phase.
@@ -287,7 +293,10 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 
 	pi.on("input", async (event, ctx) => {
 		let state = reconstructPlanState(ctx);
-		if (!state?.active || state.phase === "aborted" || state.phase === "completed") return { action: "continue" as const };
+		if (!state?.active || state.phase === "aborted" || state.phase === "completed") {
+			applyIdleTools(pi);
+			return { action: "continue" as const };
+		}
 
 		// Extension follow-ups can be submitted after a phase transition but before the
 		// prompt builder has observed the narrowed tool surface. Re-apply the durable
@@ -342,9 +351,13 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 	// the counter instead of double-kicking alongside drivePostReview.
 	pi.on("turn_end", async (_event, ctx) => {
 		const state = reconstructPlanState(ctx);
-		if (!state) return;
+		if (!state) {
+			applyIdleTools(pi);
+			return;
+		}
 		// Clean up the counter for any terminal/inactive state (aborted, completed, idle).
 		if (!state.active || state.phase === "aborted" || state.phase === "completed") {
+			applyIdleTools(pi);
 			convergenceKicks.delete(state.planId);
 			return;
 		}
@@ -760,7 +773,7 @@ function markExecutionKickSent(state: PlanFlowState): PlanFlowState {
 async function abortPlan(pi: ExtensionAPI, ctx: ExtensionContext, state: PlanFlowState, reason: string): Promise<PlanFlowState> {
 	const aborted = touch({ ...state, active: false, phase: "aborted", abortedAt: new Date().toISOString(), abortReason: reason });
 	persistPlanState(pi, aborted, "abort");
-	pi.setActiveTools(state.previousActiveTools);
+	pi.setActiveTools(stripPlanMutatingTools(state.previousActiveTools));
 	ctx.ui.setStatus("yuki-plan", undefined);
 	ctx.ui.setWidget("yuki-plan", undefined);
 	if (state.draftPath) {
@@ -775,7 +788,7 @@ async function abortPlan(pi: ExtensionAPI, ctx: ExtensionContext, state: PlanFlo
 async function closePlan(pi: ExtensionAPI, ctx: ExtensionContext, state: PlanFlowState): Promise<PlanFlowState> {
 	const closed = touch({ ...state, active: false, phase: "completed" });
 	persistPlanState(pi, closed, "phase_change");
-	pi.setActiveTools(state.previousActiveTools);
+	pi.setActiveTools(stripPlanMutatingTools(state.previousActiveTools));
 	ctx.ui.setStatus("yuki-plan", undefined);
 	ctx.ui.setWidget("yuki-plan", undefined);
 	if (ctx.hasUI) ctx.ui.notify(`yuki plan ${state.planId} completed · all todos done.`, "info");
@@ -989,12 +1002,18 @@ function renderPlanMarkdown(state: PlanFlowState): string {
 	return lines.join("\n");
 }
 
-function getAllowedToolsForState(state: PlanFlowState): string[] {
-	return getAllowedToolsForPhase(state.phase, state.previousActiveTools);
+function getAllowedToolsForState(state: PlanFlowState, currentTools: string[] = []): string[] {
+	return getAllowedToolsForPhase(state.phase, state.previousActiveTools, currentTools);
 }
 
 function applyActiveTools(pi: ExtensionAPI, state: PlanFlowState) {
-	pi.setActiveTools(getAllowedToolsForState(state));
+	const surface = derivePlanModeSurface(state, pi.getActiveTools());
+	pi.setActiveTools(surface.allowedTools);
+}
+
+function applyIdleTools(pi: ExtensionAPI) {
+	const surface = derivePlanModeSurface(undefined, pi.getActiveTools());
+	pi.setActiveTools(surface.allowedTools);
 }
 
 function buildCompactPlanWidget(state: PlanFlowState): string[] {
