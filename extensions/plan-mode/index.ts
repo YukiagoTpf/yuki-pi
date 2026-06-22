@@ -19,6 +19,7 @@ const MAX_REVIEW_REVISION_ATTEMPTS = 3;
 const PLAN_KICK_CUSTOM_TYPE = "yuki-plan-flow-kick";
 const PLAN_MODE_PROMPT_CUSTOM_TYPE = "yuki-plan-flow-mode-prompt";
 const PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE = "yuki-plan-flow-approval-preview";
+const PLAN_REVIEW_SUMMARY_CUSTOM_TYPE = "yuki-plan-flow-review-summary";
 const PLAN_WRITE_BUDGET_GUIDANCE = "Keep each plan_write call well below the model max output tokens (initial heuristic: 40%-60%). If the plan is large, first send a skeleton or concise stage-level plan: background 5-8 core lines, decisions short, each step a stage, validation <= 2 items per step.";
 
 type Phase = "idle" | "planning" | "reviewing" | "revising" | "awaiting_approval" | "executing" | "completed" | "aborted";
@@ -40,6 +41,7 @@ interface ReviewFeedback {
 	blockingIssues: Array<{ stepId?: string; issue: string; suggestion?: string }>;
 	risks?: string[];
 	missingValidation?: string[];
+	infraWarnings?: string[];
 	raw?: string;
 }
 
@@ -151,6 +153,7 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 	let consecutiveBlockedToolCalls = 0;
 
 	pi.registerMessageRenderer(PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE, (message) => new Markdown(String(message.content ?? ""), 0, 0, getMarkdownTheme()));
+	pi.registerMessageRenderer(PLAN_REVIEW_SUMMARY_CUSTOM_TYPE, (message) => new Markdown(String(message.content ?? ""), 0, 0, getMarkdownTheme()));
 
 	// Convergence guard for constrained execution only. Planning/revising are deliberately
 	// unconstrained: a turn with no tool may be a legitimate question to the user. Approval
@@ -656,10 +659,16 @@ function parseReviewFeedback(raw: string): ReviewFeedback {
 			})) : [],
 			risks: Array.isArray(parsed.risks) ? parsed.risks.filter((risk): risk is string => typeof risk === "string") : [],
 			missingValidation: Array.isArray(parsed.missingValidation) ? parsed.missingValidation.filter((item): item is string => typeof item === "string") : [],
+			infraWarnings: Array.isArray(parsed.infraWarnings) ? parsed.infraWarnings.filter((item): item is string => typeof item === "string") : [],
 			raw,
 		};
 	} catch {
-		return { summary: "Review returned non-JSON feedback; treat as blocking revision feedback.", blockingIssues: [{ issue: raw }], raw };
+		return {
+			summary: "Review output was not valid JSON.",
+			blockingIssues: [{ issue: "Review returned non-JSON feedback; inspect /plan-debug or persisted plan state for the raw review output." }],
+			infraWarnings: ["Automatic review returned non-JSON output; raw feedback is stored for debug only."],
+			raw,
+		};
 	}
 }
 
@@ -668,7 +677,61 @@ function formatReviewIssues(state: PlanFlowState): string {
 	if (state.reviewSkipped) return `Automatic review was skipped: ${state.reviewSkippedReason ?? "unknown reason"}.`;
 	const issues = state.reviewFeedback?.blockingIssues;
 	if (!issues || issues.length === 0) return "Review requested changes.";
-	return issues.map((issue, index) => `${index + 1}. ${issue.stepId ? `[${issue.stepId}] ` : ""}${issue.issue}${issue.suggestion ? ` Suggestion: ${issue.suggestion}` : ""}`).join("\n");
+	return issues.map(formatReviewIssueLine).join("\n");
+}
+
+function formatReviewIssueLine(issue: ReviewFeedback["blockingIssues"][number], index: number): string {
+	return `${index + 1}. ${issue.stepId ? `[${issue.stepId}] ` : ""}${issue.issue}${issue.suggestion ? ` Suggestion: ${issue.suggestion}` : ""}`;
+}
+
+function reviewStatusLabel(state: PlanFlowState): string {
+	if (state.reviewSkipped) return `skipped (${state.reviewSkippedReason ?? "unknown reason"})`;
+	if (state.reviewFeedback?.blockingIssues?.length) return `blocking (${state.reviewFeedback.blockingIssues.length} issue(s))`;
+	if (state.reviewed) return "passed";
+	if (state.reviewPending) return "pending";
+	return "not completed";
+}
+
+function renderReviewSummaryLines(state: PlanFlowState): string[] {
+	const feedback = state.reviewFeedback;
+	const lines = [`- Automatic review: ${reviewStatusLabel(state)}`];
+	if (state.reviewSkipped) return lines;
+	if (!feedback) return lines;
+	lines.push(`- Summary: ${feedback.summary || "Review completed."}`);
+	if (feedback.blockingIssues.length > 0) {
+		lines.push("- Blocking issues:");
+		feedback.blockingIssues.slice(0, 8).forEach((issue, index) => lines.push(`  - ${formatReviewIssueLine(issue, index)}`));
+		if (feedback.blockingIssues.length > 8) lines.push(`  - ... ${feedback.blockingIssues.length - 8} more issue(s); use /plan-debug for details.`);
+	}
+	if (feedback.missingValidation?.length) lines.push(`- Missing validation: ${feedback.missingValidation.join(", ")}`);
+	if (feedback.risks?.length) {
+		lines.push("- Risks:");
+		feedback.risks.slice(0, 5).forEach((risk) => lines.push(`  - ${risk}`));
+	}
+	if (feedback.infraWarnings?.length) {
+		lines.push("- Review infrastructure warnings:");
+		feedback.infraWarnings.forEach((warning) => lines.push(`  - ${warning}`));
+	}
+	return lines;
+}
+
+function renderReviewSummaryMarkdown(state: PlanFlowState): string {
+	return [
+		"## Yuki plan review summary",
+		"",
+		`Plan: ${state.title ?? state.planId}`,
+		"",
+		...renderReviewSummaryLines(state),
+	].join("\n");
+}
+
+function publishReviewSummary(pi: ExtensionAPI, state: PlanFlowState): void {
+	pi.sendMessage({
+		customType: PLAN_REVIEW_SUMMARY_CUSTOM_TYPE,
+		content: renderReviewSummaryMarkdown(state),
+		display: true,
+		details: { planId: state.planId, phase: state.phase },
+	});
 }
 
 function reconstructPlanState(ctx: ExtensionContext): PlanFlowState | undefined {
@@ -1005,6 +1068,13 @@ async function driveUiApproval(pi: ExtensionAPI, ctx: ExtensionContext, planId: 
  * its history preview can render once isStreaming is false (agent_end itself fires
  * before finishRun clears isStreaming) and before the inline approval selector opens. */
 async function drivePostReview(pi: ExtensionAPI, ctx: ExtensionContext, state: PlanFlowState): Promise<void> {
+	publishReviewSummary(pi, state);
+	if (state.reviewSkipped && ctx.hasUI) {
+		ctx.ui.notify(`Automatic review skipped: ${state.reviewSkippedReason ?? "unknown reason"}.`, "warning");
+	}
+	if (state.reviewFeedback?.infraWarnings?.length && ctx.hasUI) {
+		ctx.ui.notify(`Automatic review completed with infrastructure warning(s): ${state.reviewFeedback.infraWarnings.join("; ")}`, "warning");
+	}
 	if (state.phase === "revising") {
 		const issueCount = state.reviewFeedback?.blockingIssues.length ?? 0;
 		const issueText = formatReviewIssues(state);
@@ -1013,12 +1083,13 @@ async function drivePostReview(pi: ExtensionAPI, ctx: ExtensionContext, state: P
 			publishRevisionLoopStop(pi, state, issueText);
 			return;
 		}
-		if (ctx.hasUI) ctx.ui.notify(`Automatic review found ${issueCount} blocking issue(s); revising automatically (${state.reviewRevisionAttempts}/${MAX_REVIEW_REVISION_ATTEMPTS}).`, "warning");
+		if (ctx.hasUI) ctx.ui.notify(`Automatic review found ${issueCount} blocking issue(s); revising plan (attempt ${state.reviewRevisionAttempts}/${MAX_REVIEW_REVISION_ATTEMPTS}).`, "info");
 		continueRevisionTurn(pi, state, issueText);
 		return;
 	}
 
 	// phase === awaiting_approval (review passed or skipped)
+	if (!state.reviewSkipped && ctx.hasUI) ctx.ui.notify("Automatic review passed; plan is awaiting approval.", "info");
 	if (state.approvalMode === "auto") {
 		const approved = await approvePlan(pi, ctx, state);
 		persistPlanState(pi, approved, "approval");
@@ -1123,7 +1194,7 @@ function renderPlanMarkdown(state: PlanFlowState): string {
 	lines.push("");
 	lines.push("## Review");
 	lines.push("");
-	lines.push(`- Automatic review: ${state.reviewSkipped ? `skipped (${state.reviewSkippedReason})` : state.reviewed ? "completed" : "not completed"}`);
+	lines.push(...renderReviewSummaryLines(state));
 	lines.push("");
 	return lines.join("\n");
 }
@@ -1497,6 +1568,7 @@ function normalizePlanState(state: PlanFlowState): PlanFlowState {
 		risks: state.risks ?? [],
 		approvalMode: state.approvalMode ?? "ui",
 		reviewRevisionAttempts: state.reviewRevisionAttempts ?? 0,
+		reviewFeedback: state.reviewFeedback ? { ...state.reviewFeedback, infraWarnings: state.reviewFeedback.infraWarnings ?? [] } : undefined,
 		reviewBlockingHistory: state.reviewBlockingHistory ?? [],
 		previousActiveTools: state.previousActiveTools ?? [],
 		currentActiveTools: state.currentActiveTools ?? [],
