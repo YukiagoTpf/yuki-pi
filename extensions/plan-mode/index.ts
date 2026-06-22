@@ -1071,9 +1071,10 @@ function applyPlanWrite(current: PlanFlowState, params: PlanWriteInput): PlanFlo
 
 async function choosePlanApproval(ctx: ExtensionContext, current: PlanFlowState, message?: string): Promise<ApprovalChoice | undefined> {
 	// Approval uses the same inline selector mechanism as ask_user_question: no
-	// floating overlay. The full plan markdown is published to the history stream by
+	// floating overlay. A compact plan summary is published to the history stream by
 	// publishApprovalPreview() before this call, so it stays visible above the selector.
-	const title = message ?? `Approve yuki plan '${current.title ?? current.planId}'? (full plan shown above)`;
+	// The full plan lives at the draft path and via /plan-debug.
+	const title = message ?? `Approve yuki plan '${current.title ?? current.planId}'? (summary shown above; /plan-debug for full plan)`;
 	const choice = await ctx.ui.select(title, ["Approve", "Request revision", "Cancel"]);
 	return choice === "Approve" || choice === "Request revision" || choice === "Cancel" ? (choice as ApprovalChoice) : undefined;
 }
@@ -1087,20 +1088,51 @@ function publishApprovalPreview(pi: ExtensionAPI, state: PlanFlowState, message?
 	});
 }
 
+/** P3: compact approval preview. Shows title + request + step list + review findings +
+ * top risks only, instead of the full renderPlanMarkdown, so long plans do not fill the
+ * chat window. The full plan remains available at the draft path and via /plan-debug. */
 function renderApprovalPreviewMarkdown(state: PlanFlowState, message?: string): string {
 	const title = message ?? `Approve yuki plan '${state.title ?? state.planId}'?`;
-	return [
-		"---",
-		"## Yuki plan awaiting approval",
-		"",
-		`**${title}**`,
-		"",
-		"The approval controls are shown below. This preview is in the normal history stream, so use terminal scrollback to read it.",
-		"",
-		renderPlanMarkdown(state).trim(),
-		"",
-		"---",
-	].join("\n");
+	const lines: string[] = [];
+	lines.push("---");
+	lines.push("## Yuki plan awaiting approval");
+	lines.push("");
+	lines.push(`**${title}**`);
+	lines.push("");
+	lines.push(`Plan ID: \`${state.planId}\`${state.title ? ` · Title: ${state.title}` : ""}`);
+	lines.push("");
+	lines.push("### Request");
+	lines.push("");
+	lines.push(state.request);
+	lines.push("");
+	lines.push("### Steps");
+	lines.push("");
+	if (state.steps.length === 0) {
+		lines.push("- None.");
+	} else {
+		state.steps.forEach((step, index) => {
+			lines.push(`${index + 1}. ${step.content} (\`${step.id}\`)`);
+			if (step.files?.length) lines.push(`   - Files: ${step.files.join(", ")}`);
+			if (step.validation?.length) lines.push(`   - Validation: ${step.validation.join("; ")}`);
+		});
+	}
+	lines.push("");
+	lines.push("### Review");
+	lines.push("");
+	lines.push(...renderReviewSummaryLines(state));
+	lines.push("");
+	if (state.risks.length > 0) {
+		lines.push("### Key risks");
+		lines.push("");
+		state.risks.slice(0, 5).forEach((risk) => lines.push(`- ${risk}`));
+		if (state.risks.length > 5) lines.push(`- ...and ${state.risks.length - 5} more`);
+		lines.push("");
+	}
+	lines.push("Full plan: `" + state.draftPath + "` or `/plan-debug`.");
+	lines.push("The approval controls are shown below.");
+	lines.push("");
+	lines.push("---");
+	return lines.join("\n");
 }
 
 async function approvePlan(pi: ExtensionAPI, ctx: ExtensionContext, current: PlanFlowState): Promise<PlanFlowState> {
@@ -1173,15 +1205,22 @@ async function closePlan(pi: ExtensionAPI, ctx: ExtensionContext, state: PlanFlo
 
 /** rev.3 P1-2: enrich the executing widget with the current in_progress todo so the
  * user can see live progress without running /plan-debug. */
+/** rev.3 P1-2: enrich the executing widget with the current in_progress todo so the
+ * user can see live progress without running /plan-debug.
+ *
+ * P3降噪: widget only shows plan title/phase + progress + next action. Detailed
+ * per-step status lives in the plan-owned todo list and /plan-debug, so we no longer
+ * duplicate the todo list id or the full in_progress todo text here. */
 function updateExecutingWidget(ctx: ExtensionContext, state: PlanFlowState, todoState: { todos: Array<{ status: string; id: string; content: string; activeForm: string }> }): void {
 	if (!ctx.hasUI) return;
 	const completed = todoState.todos.filter((todo) => todo.status === "completed").length;
 	const total = todoState.todos.length;
+	const label = state.title ? state.title : state.planId;
+	const lines = [`${label} · executing · ${completed}/${total} done`];
 	const inProgress = todoState.todos.find((todo) => todo.status === "in_progress");
-	const lines = [`Plan executing · ${completed}/${total} done · list ${state.todoListId ?? "?"}`];
-	if (inProgress) lines.push(`▶ ${inProgress.id}: ${inProgress.activeForm || inProgress.content}`);
+	if (inProgress) lines.push(`Next: ${inProgress.activeForm || inProgress.content}`);
 	else if (completed === total) lines.push("All steps completed.");
-	else lines.push("Next: pick the next pending step with todo_write.");
+	else lines.push("Next: mark the next pending step in_progress via todo_write.");
 	ctx.ui.setWidget("yuki-plan", lines);
 }
 
@@ -1582,7 +1621,7 @@ export async function startPlanFlow(pi: ExtensionAPI, ctx: ExtensionContext, opt
 		version: 1,
 		active: true,
 		phase: "planning",
-		planId: createPlanId(),
+		planId: createPlanId(request),
 		request,
 		planningContext: opts.planningContext,
 		previousActiveTools,
@@ -1670,11 +1709,18 @@ function buildWrongPhaseResult(toolName: string, state: PlanFlowState, extra?: s
 
 function buildPlanModePrompt(state: PlanFlowState | undefined, status: ReturnType<typeof buildPlanModeStatus>): string {
 	const available = status.availablePlanTools.length > 0 ? status.availablePlanTools.join(", ") : "none";
+	// This block is internal routing metadata injected into your context. Do NOT echo it
+	// back in your visible assistant reply, repeat its prefix, or restate it as a
+	// commentary (e.g. do not tell the user "current is idle/normal mode" or "there is
+	// no active plan"). Only surface plan status to the user when they explicitly ask
+	// about it, trigger /plan, or the plan state changes.
+	const doNotEcho = "Internal routing metadata: do not echo this banner or restate plan mode/idle/active-plan status in your visible reply unless the user explicitly asks about plan status, triggers /plan, or the plan state changes.";
 	const header = [
 		`[YUKI PLAN MODE: ${status.mode}]`,
 		`Active plan: ${status.active ? "yes" : "no"}`,
 		`Available plan tools: ${available}. Always available for self-check: ${PLAN_STATUS_TOOL}.`,
 		status.guidance,
+		doNotEcho,
 	];
 	if (!state) {
 		return [
@@ -1817,12 +1863,17 @@ function renderPlanningContextGuidance(state: PlanFlowState): string {
 	return lines.join("\n");
 }
 
-function createPlanId(): string {
+/** Human-readable plan id: a date-stamped slug (from the plan request/title) plus a
+ * short random suffix for uniqueness. Reads as e.g. `20260622-render-effect-harness-a1b2c3d4`
+ * while staying machine-trackable. Falls back to the pure timestamp+random form when no
+ * seed is provided. */
+function createPlanId(seed?: string): string {
 	const now = new Date();
 	const pad = (value: number) => String(value).padStart(2, "0");
-	const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+	const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
 	const random = Math.random().toString(16).slice(2, 10).padEnd(8, "0");
-	return `${stamp}-${random}`;
+	const slug = seed ? slugify(seed) : "";
+	return slug ? `${stamp}-${slug}-${random}` : `${stamp}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}-${random}`;
 }
 
 async function exists(path: string): Promise<boolean> {

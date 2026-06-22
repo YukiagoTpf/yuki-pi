@@ -35,6 +35,10 @@ describe("plan-mode v2 integration guards", () => {
 		assert.match(source, /PLAN_MODE_PROMPT_CUSTOM_TYPE/);
 		assert.match(source, /buildPlanModePrompt\(activeState, status\)/);
 		assert.match(source, /Normal\/idle mode: continue normal assistance/);
+		// P3: banner must carry a do-not-echo constraint so internal routing metadata
+		// is never restated in the visible assistant reply.
+		assert.match(source, /Internal routing metadata: do not echo this banner/);
+		assert.match(source, /do not echo this banner or restate plan mode\/idle\/active-plan status/);
 		assert.doesNotMatch(source, /Disabled plan tools/);
 		const beforeAgentStart = extractHandler("before_agent_start");
 		assert.match(beforeAgentStart, /applyActiveTools\(pi, state\)/);
@@ -124,7 +128,22 @@ describe("plan-mode v2 integration guards", () => {
 		assert.doesNotMatch(source, /state\.steps\.map\(\(step, index\) => `\$\{index \+ 1\}\. \$\{step\.content\}`\)/);
 	});
 
-	it("prints the full plan markdown to history and uses an inline select for approval", () => {
+	it("uses a human-readable slugified plan id seeded from the request (P3)", () => {
+		assert.match(source, /function createPlanId\(seed\?: string\)/);
+		assert.match(source, /const slug = seed \? slugify\(seed\) : "";/);
+		assert.match(source, /slug \? `\$\{stamp\}-\$\{slug\}-\$\{random\}`/);
+		assert.match(source, /planId: createPlanId\(request\),/);
+	});
+
+	it("keeps the executing widget de-duplicated from the todo list (P3)", () => {
+		assert.match(source, /P3降噪: widget only shows plan title\/phase \+ progress \+ next action/);
+		// widget must NOT duplicate the todo list id line or the bare "list <id>" form.
+		const widgetFn = source.slice(source.indexOf("function updateExecutingWidget"), source.indexOf("type ApprovalOutcome"));
+		assert.doesNotMatch(widgetFn, /list \$\{state\.todoListId/);
+		assert.match(widgetFn, /executing · \$\{completed\}\/\$\{total\} done/);
+	});
+
+	it("prints a compact plan summary to history and uses an inline select for approval", () => {
 		assert.match(source, /import \{[^}]*getMarkdownTheme[^}]*withFileMutationQueue[^}]*\}/);
 		assert.match(source, /import \{ Markdown, Text \}/);
 		assert.doesNotMatch(source, /matchesKey/);
@@ -141,12 +160,21 @@ describe("plan-mode v2 integration guards", () => {
 		assert.match(source, /route[\s\S]*pi\.sendMessage[\s\S]*into agent\.steer/);
 		assert.match(source, /UI approval is deferred until the next macrotask after agent_end/);
 		assert.match(source, /function renderApprovalPreviewMarkdown/);
-		assert.match(source, /renderPlanMarkdown\(state\)\.trim\(\)/);
+		// P3: preview is now a compact summary, not the full renderPlanMarkdown.
+		assert.doesNotMatch(source, /renderPlanMarkdown\(state\)\.trim\(\)/);
+		assert.match(source, /P3: compact approval preview/);
+		assert.match(source, /### Request/);
+		assert.match(source, /### Steps/);
+		assert.match(source, /### Review/);
+		assert.match(source, /Full plan: `\" \+ state\.draftPath \+ "`/);
 		assert.match(source, /publishApprovalPreview\(pi, current, message\)/);
 		// Approval must use the inline select (same mechanism as ask_user_question),
 		// never a floating overlay that obscures the history preview.
 		assert.match(source, /ctx\.ui\.select\(title, \["Approve", "Request revision", "Cancel"\]\)/);
-		assert.match(source, /full plan shown above/);
+		// P3: selector title no longer promises the full plan is shown above; it points
+		// to the compact summary plus /plan-debug for the full plan.
+		assert.match(source, /summary shown above; \/plan-debug for full plan/);
+		assert.doesNotMatch(source, /full plan shown above/);
 		assert.doesNotMatch(source, /overlayOptions/);
 		assert.doesNotMatch(source, /anchor: "bottom-center"/);
 		assert.doesNotMatch(source, /ctx\.ui\.custom<ApprovalChoice/);
