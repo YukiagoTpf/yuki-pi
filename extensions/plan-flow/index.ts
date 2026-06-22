@@ -521,7 +521,7 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			"plan_write is the source of truth for plan steps; do not create free-form plan markdown instead.",
 			"Each plan_write step must include content and activeForm, and should include validation when possible.",
 			"Include decisions and assumptions explicitly so the implementation has no unresolved branches.",
-			"For large plans, use mode:'skeleton' for title+steps, mode:'patch' for local additions, and mode:'full' only when ready for review.",
+			"For large plans, use mode:'skeleton' for title+steps, mode:'patch' for local additions (field/value or {append:[...]} for array fields), and mode:'full' only when ready for review.",
 			PLAN_WRITE_BUDGET_GUIDANCE,
 		],
 		parameters: PlanWriteParams,
@@ -699,9 +699,9 @@ function persistPlanState(pi: ExtensionAPI, state: PlanFlowState, reason: PlanSt
 	pi.appendEntry(PLAN_STATE_CUSTOM_TYPE, { kind: state.phase === "aborted" ? "abort" : "snapshot", reason, planId: state.planId, state } satisfies PlanStateRecord);
 }
 
-function normalizePlanWriteSteps(rawSteps: PlanWriteInput["steps"]): PlanStep[] {
+function normalizePlanWriteSteps(rawSteps: PlanWriteInput["steps"], indexOffset = 0): PlanStep[] {
 	const steps = (rawSteps ?? []).map((step, index) => ({
-		id: step.id?.trim() || `step-${index + 1}`,
+		id: step.id?.trim() || `step-${indexOffset + index + 1}`,
 		content: step.content.trim(),
 		activeForm: step.activeForm.trim(),
 		rationale: step.rationale?.trim() || undefined,
@@ -743,14 +743,28 @@ function assertMandatoryValidationCovered(current: PlanFlowState, steps: PlanSte
 	}
 }
 
+function stringArrayPatch(value: unknown, current: string[]): string[] {
+	if (Array.isArray(value)) return normalizeStringArray(value.filter((item): item is string => typeof item === "string"));
+	if (value && typeof value === "object" && Array.isArray((value as { append?: unknown }).append)) {
+		return [...current, ...normalizeStringArray((value as { append: unknown[] }).append.filter((item): item is string => typeof item === "string"))];
+	}
+	throw new Error("plan_write: patch value must be an array or {append:[...]} for this field.");
+}
+
 function applySinglePlanPatch(draft: PlanFlowState, field: PlanWriteInput["field"], value: unknown): PlanFlowState {
 	if (!field) return draft;
 	if (field === "title") return { ...draft, title: requirePlanWriteString(typeof value === "string" ? value : undefined, "value") };
 	if (field === "background") return { ...draft, background: requirePlanWriteString(typeof value === "string" ? value : undefined, "value") };
-	if (field === "steps") return { ...draft, steps: normalizePlanWriteSteps(Array.isArray(value) ? value as PlanWriteInput["steps"] : undefined) };
-	if (field === "decisions") return { ...draft, decisions: normalizeStringArray(Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : undefined) };
-	if (field === "assumptions") return { ...draft, assumptions: normalizeStringArray(Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : undefined) };
-	if (field === "risks") return { ...draft, risks: normalizeStringArray(Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : undefined) };
+	if (field === "steps") {
+		if (Array.isArray(value)) return { ...draft, steps: normalizePlanWriteSteps(value as PlanWriteInput["steps"]) };
+		if (value && typeof value === "object" && Array.isArray((value as { append?: unknown }).append)) {
+			return { ...draft, steps: [...draft.steps, ...normalizePlanWriteSteps((value as { append: PlanWriteInput["steps"] }).append, draft.steps.length)] };
+		}
+		throw new Error("plan_write: patch value must be a steps array or {append:[...]} for steps.");
+	}
+	if (field === "decisions") return { ...draft, decisions: stringArrayPatch(value, draft.decisions) };
+	if (field === "assumptions") return { ...draft, assumptions: stringArrayPatch(value, draft.assumptions) };
+	if (field === "risks") return { ...draft, risks: stringArrayPatch(value, draft.risks) };
 	return draft;
 }
 
@@ -1428,7 +1442,7 @@ function buildPhasePrompt(state: PlanFlowState): string {
 			"Ask at most five high-impact questions total using ask_user_question if available, otherwise plain assistant text.",
 			"If ambiguity is low-risk, proceed with an explicit assumption and record it in plan_write.assumptions.",
 			"Call plan_write only when the plan is decision-complete enough for another agent to execute.",
-			"plan_write modes: skeleton saves title+steps without review; patch updates draft fields; full submits the complete plan for review.",
+			"plan_write modes: skeleton saves title+steps without review; patch updates draft fields or appends via {append:[...]}; full submits the accumulated plan for review.",
 			"plan_write full mode must include files/rationale/validation where relevant, plus decisions and assumptions.",
 			PLAN_WRITE_BUDGET_GUIDANCE,
 			renderPlanningContextGuidance(state),
