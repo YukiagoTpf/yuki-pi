@@ -39,6 +39,13 @@ describe("plan-flow v2 integration guards", () => {
 		assert.doesNotMatch(beforeAgentStart, /PLAN_MODE_PROMPT_CUSTOM_TYPE/);
 	});
 
+	it("returns a terminating result for stale plan_write calls with no active plan", () => {
+		assert.match(source, /function buildNoActivePlanResult/);
+		assert.match(source, /return buildNoActivePlanResult\("plan_write"\)/);
+		assert.match(source, /there is no active plan/);
+		assert.doesNotMatch(source, /throw new Error\("plan_write: no active yuki plan/);
+	});
+
 	it("requires explicit approvalMode for direct callers such as ta-dev", () => {
 		assert.match(source, /approvalMode: ApprovalMode;/);
 		assert.match(source, /startPlanFlow\(pi, ctx, \{ request, planningContext, approvalMode: "ui" \}\)/);

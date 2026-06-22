@@ -483,7 +483,10 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 		parameters: PlanWriteParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const current = reconstructPlanState(ctx);
-			if (!current?.active || current.phase === "aborted") throw new Error("plan_write: no active yuki plan. Start with /plan <request>.");
+			if (!current?.active || current.phase === "aborted" || current.phase === "completed") {
+				applyIdleTools(pi);
+				return buildNoActivePlanResult("plan_write");
+			}
 			if (!["planning", "revising"].includes(current.phase)) {
 				return buildWrongPhaseResult("plan_write", current);
 			}
@@ -1263,6 +1266,14 @@ function nextActionHint(state: PlanFlowState): string {
  * tool_call handler: blocked/thrown tool calls do not terminate the turn, so the model can
  * retry against the frozen mid-turn tool snapshot. A terminating result exits cleanly; the
  * active tool set is narrowed for the next real prompt. */
+function buildNoActivePlanResult(toolName: string): { content: Array<{ type: "text"; text: string }>; details: { active: false; phase: "idle" }; terminate: true } {
+	return {
+		content: [{ type: "text" as const, text: `yuki plan-flow: ${toolName} is not valid right now because there is no active plan. Normal/idle mode is active. Ending this turn; start a plan with /plan <request> before calling plan_write.` }],
+		details: { active: false, phase: "idle" },
+		terminate: true,
+	};
+}
+
 function buildWrongPhaseResult(toolName: string, state: PlanFlowState, extra?: string): { content: Array<{ type: "text"; text: string }>; details: { state: PlanFlowState }; terminate: true } {
 	const hint = nextActionHint(state);
 	const text = extra
