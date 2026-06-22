@@ -602,18 +602,109 @@ async function runAutomaticReview(ctx: ExtensionContext, state: PlanFlowState): 
 	if (!reviewing.subagentReviewUsed) {
 		try {
 			const feedback = await runPlanReviewerSubagent(ctx, reviewing);
-			return applyReviewFeedback(reviewing, feedback, true);
+			return applyReviewFeedback(reviewing, mergeHarnessContractGaps(feedback, reviewing), true);
 		} catch (error) {
 			const warning = `plan-reviewer subagent failed or timed out; fell back to direct review: ${String(error)}`;
 			const fallback = await runDirectCompleteReview(ctx, reviewing, [warning]);
 			if (fallback.kind === "skipped") return skipReview(reviewing, fallback.reason, true);
-			return applyReviewFeedback(reviewing, fallback.feedback, true);
+			return applyReviewFeedback(reviewing, mergeHarnessContractGaps(fallback.feedback, reviewing), true);
 		}
 	}
 
 	const direct = await runDirectCompleteReview(ctx, reviewing);
 	if (direct.kind === "skipped") return skipReview(reviewing, direct.reason, reviewing.subagentReviewUsed ?? false);
-	return applyReviewFeedback(reviewing, direct.feedback, reviewing.subagentReviewUsed ?? false);
+	return applyReviewFeedback(reviewing, mergeHarnessContractGaps(direct.feedback, reviewing), reviewing.subagentReviewUsed ?? false);
+}
+
+/** P4: structural harness-contract gap check. plan-mode should natively understand
+ * Harness contract / validation intent rather than treating it as plain text. This
+ * deterministic pass inspects the plan draft for the contract invariants the roadmap
+ * (part 3 Phase P4) requires, independent of the LLM/subagent review:
+ *  - a RenderFeature / capture plan must declare a capture target somewhere (a step
+ *    validation that names a capture target), or a justified opt-out in assumptions;
+ *  - a plan that declares intermediate resources (steps whose validation mentions a
+ *    consumers check) must not be missing the consumer check itself;
+ *  - missing mandatory validation (already enforced at plan_write, but re-surfaced here
+ *    for visibility in the review summary).
+ * Gaps are merged into the review feedback as blocking issues so they are visible to the
+ * user and drive revision, the same way subagent findings are. */
+function mergeHarnessContractGaps(feedback: ReviewFeedback, state: PlanFlowState): ReviewFeedback {
+	const gaps = deriveHarnessContractGaps(state);
+	if (gaps.length === 0) return feedback;
+	const existing = new Set(feedback.blockingIssues.map((issue) => issue.issue));
+	const newBlocking = gaps.filter((gap) => !existing.has(gap.issue));
+	if (newBlocking.length === 0) return feedback;
+	return {
+		...feedback,
+		summary: feedback.summary === "Review completed." || feedback.summary === "Review output was not valid JSON."
+			? `Automatic review found ${newBlocking.length} harness-contract gap(s).`
+			: `${feedback.summary} (+${newBlocking.length} harness-contract gap(s))`,
+		blockingIssues: [...feedback.blockingIssues, ...newBlocking],
+		findings: [...(feedback.findings ?? []), ...newBlocking.map((gap) => ({ ...gap, severity: "major" as const }))],
+	};
+}
+
+/** Determine whether a step validation phrase names a capture target / final output
+ * verification. Mirrors the RenderEffect harness capture-target sensor family. */
+function validationDeclaresCaptureTarget(validations: string[] | undefined): boolean {
+	if (!validations?.length) return false;
+	return validations.some((v) => /\b(capture|render[_-]?output|color[_-]?buffer|prepass[_-]?out|golden|visual[_-]?delta|baseline)\b/i.test(v));
+}
+
+/** Determine whether a step validation phrase declares an intermediate resource that
+ * would require a consumers check. */
+function validationDeclaresIntermediateResource(validations: string[] | undefined): boolean {
+	if (!validations?.length) return false;
+	return validations.some((v) => /\b(intermediate|rt[_-]?consumers|consumers?[_-]?check|global[_-]?texture|render[_-]?texture)\b/i.test(v));
+}
+
+function validationDeclaresConsumersCheck(validations: string[] | undefined): boolean {
+	if (!validations?.length) return false;
+	return validations.some((v) => /\b(rt[_-]?consumers|consumers?[_-]?check)\b/i.test(v));
+}
+
+function deriveHarnessContractGaps(state: PlanFlowState): ReviewIssue[] {
+	const gaps: ReviewIssue[] = [];
+	const looksLikeRenderEffectPlan = /\brender[_-]?(feature|effect|pass)|prp|post[_-]?effect|shader|material|volume\b/i.test(state.request) ||
+		/\brender[_-]?(feature|effect|pass)|prp|post[_-]?effect\b/i.test(state.background ?? "");
+
+	// Capture target / final output: RenderFeature-style plans must declare a capture
+	// target, or carry a justified opt-out in assumptions.
+	const hasCaptureTarget = state.steps.some((step) => validationDeclaresCaptureTarget(step.validation));
+	const hasOptOut = state.assumptions.some((a) => /opt[_-]?out|no[_-]?capture|subject[_-]?quality|manual[_-]?verification/i.test(a));
+	if (looksLikeRenderEffectPlan && !hasCaptureTarget && !hasOptOut) {
+		gaps.push({
+			issue: "RenderFeature/effect plan does not declare a capture target (e.g. render_output_check / ColorBuffer / PrePassOut) or a justified opt-out in assumptions.",
+			suggestion: "Add a capture-target validation intent to the step that produces the final output, or record a justified opt-out in plan_write.assumptions.",
+		});
+	}
+
+	// Intermediate resources must declare a consumers check.
+	const declaresIntermediate = state.steps.some((step) => validationDeclaresIntermediateResource(step.validation));
+	const declaresConsumersCheck = state.steps.some((step) => validationDeclaresConsumersCheck(step.validation));
+	if (declaresIntermediate && !declaresConsumersCheck) {
+		gaps.push({
+			issue: "Plan declares intermediate render resources but no step validates their consumers (rt-consumers-check).",
+			suggestion: "Add an rt-consumers-check validation intent on the step that creates the intermediate resource, asserting it is consumed by a later pass.",
+		});
+	}
+
+	// Validation intent params should be specific enough: every step touching a file
+	// should carry at least one validation entry.
+	const mandatory = state.planningContext?.mandatoryValidation?.filter(Boolean) ?? [];
+	for (const step of state.steps) {
+		if (step.files?.length && (!step.validation || step.validation.length === 0)) {
+			gaps.push({
+				stepId: step.id,
+				issue: `Step '${step.id}' touches files but declares no validation intent.`,
+				suggestion: mandatory.length > 0
+					? `Add a validation intent covering the mandatory sensor(s): ${mandatory.join(", ")}.`
+					: "Add a validation intent (sensor + expected outcome) for this step's touched files.",
+			});
+		}
+	}
+
+	return gaps;
 }
 
 function applyReviewFeedback(reviewing: PlanFlowState, feedback: ReviewFeedback, subagentReviewUsed: boolean): PlanFlowState {
@@ -912,6 +1003,36 @@ function renderReviewSummaryMarkdown(state: PlanFlowState): string {
 	].join("\n");
 }
 
+/** P4: render the harness validation matrix for the approval preview, so the user can
+ * see "this plan will prove what with which sensor" before approving, without reading
+ * the full raw markdown. Each step row lists its declared validation intents; mandatory
+ * sensors from the planning context are flagged. */
+function renderValidationMatrixLines(state: PlanFlowState): string[] {
+	const mandatory = state.planningContext?.mandatoryValidation?.filter(Boolean) ?? [];
+	const covered = new Set<string>();
+	const rows: string[] = [];
+	for (const step of state.steps) {
+		const intents = step.validation ?? [];
+		for (const m of mandatory) {
+			if (intents.some((v) => v.toLowerCase().includes(m.toLowerCase()))) covered.add(m.toLowerCase());
+		}
+		const intentText = intents.length > 0 ? intents.join("; ") : "_(none declared)_";
+		rows.push(`- \`${step.id}\`: ${intentText}`);
+	}
+	if (rows.length === 0) return ["### Validation matrix", "", "- _(no steps)_", ""];
+	const lines = ["### Validation matrix", ""];
+	if (mandatory.length > 0) {
+		const missing = mandatory.filter((m) => !covered.has(m.toLowerCase()));
+		lines.push(`Mandatory sensors: ${mandatory.join(", ")}`);
+		lines.push(missing.length === 0 ? "- All mandatory sensors covered by step validation." : `- **Missing coverage:** ${missing.join(", ")}`);
+		lines.push("");
+	}
+	lines.push("Per-step validation intents:");
+	lines.push(...rows);
+	lines.push("");
+	return lines;
+}
+
 function publishReviewSummary(pi: ExtensionAPI, state: PlanFlowState): void {
 	pi.sendMessage({
 		customType: PLAN_REVIEW_SUMMARY_CUSTOM_TYPE,
@@ -1121,6 +1242,7 @@ function renderApprovalPreviewMarkdown(state: PlanFlowState, message?: string): 
 	lines.push("");
 	lines.push(...renderReviewSummaryLines(state));
 	lines.push("");
+	lines.push(...renderValidationMatrixLines(state));
 	if (state.risks.length > 0) {
 		lines.push("### Key risks");
 		lines.push("");

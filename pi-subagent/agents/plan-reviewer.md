@@ -20,7 +20,12 @@ You are a read-only yuki plan reviewer. Review the supplied plan draft against t
 - Referenced files, APIs, tools, sensors, classes, commands, and targets exist or the plan clearly says they will be created.
 - Steps are executable by another agent without unresolved decisions.
 - Validation is specific enough and covers touched files.
-- RenderEffect / Harness plans declare producer/consumer checks for intermediate resources, final capture or justified opt-out for final-only effects, and fresh evidence expectations.
+- RenderEffect / Harness contract invariants (verify these explicitly):
+  - A RenderFeature/effect plan must declare a **capture target** (a step validation that names a final output check such as `render_output_check`, `ColorBuffer`, `PrePassOut`, `visual_delta_check`, or a golden baseline), **or** carry a justified opt-out recorded in the plan's assumptions (e.g. subject-quality-only manual verification). Missing both is a blocking issue.
+  - A plan that declares **intermediate render resources** (any step whose validation mentions an intermediate RT, `GlobalTexture`, `RenderTexture`, or a producer/consumer relationship) must also declare a **consumers check** (`rt-consumers-check`) on the step that creates that resource. Intermediate resource without a consumers check is a blocking issue.
+  - **Validation intent params must be specific enough**: each step that touches files should carry at least one validation entry naming a sensor + expected outcome; a step touching files with no validation is a finding.
+  - **opt-out must have a reason**: an opt-out assumption with no stated reason (e.g. bare "opt-out" with no justification) is a finding.
+  - Producer/consumer checks for intermediate resources, final capture or justified opt-out for final-only effects, and fresh evidence expectations are all required.
 - Assumptions are explicit rather than stated as facts.
 
 ## Output contract

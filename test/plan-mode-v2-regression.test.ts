@@ -197,4 +197,34 @@ describe("plan-mode v2 integration guards", () => {
 		assert.match(source, /normalizeReviewFindings/);
 		assert.match(source, /evidence/);
 	});
+
+	it("natively checks harness contract gaps during review (P4)", () => {
+		assert.match(source, /P4: structural harness-contract gap check/);
+		assert.match(source, /function mergeHarnessContractGaps\(feedback: ReviewFeedback, state: PlanFlowState\)/);
+		assert.match(source, /function deriveHarnessContractGaps\(state: PlanFlowState\)/);
+		assert.match(source, /function validationDeclaresCaptureTarget/);
+		assert.match(source, /function validationDeclaresIntermediateResource/);
+		assert.match(source, /function validationDeclaresConsumersCheck/);
+		// gaps are merged into review feedback on both subagent and direct paths
+		assert.match(source, /return applyReviewFeedback\(reviewing, mergeHarnessContractGaps\(feedback, reviewing\), true\)/);
+		assert.match(source, /return applyReviewFeedback\(reviewing, mergeHarnessContractGaps\(direct\.feedback, reviewing\)/);
+		// capture-target gap message
+		assert.match(source, /RenderFeature\/effect plan does not declare a capture target/);
+		// intermediate-resource consumers-check gap message
+		assert.match(source, /declares intermediate render resources but no step validates their consumers/);
+		// per-step files-without-validation gap
+		assert.match(source, /touches files but declares no validation intent/);
+	});
+
+	it("surfaces a validation matrix in the approval preview (P4)", () => {
+		assert.match(source, /P4: render the harness validation matrix for the approval preview/);
+		assert.match(source, /function renderValidationMatrixLines\(state: PlanFlowState\)/);
+		assert.match(source, /### Validation matrix/);
+		assert.match(source, /Mandatory sensors:/);
+		assert.match(source, /All mandatory sensors covered by step validation\./);
+		assert.match(source, /\*\*Missing coverage:\*\*/);
+		assert.match(source, /Per-step validation intents:/);
+		// the matrix is wired into the compact approval preview
+		assert.match(source, /lines\.push\(\.\.\.renderValidationMatrixLines\(state\)\);/);
+	});
 });
