@@ -548,12 +548,13 @@ export default function planFlowExtension(pi: ExtensionAPI) {
 			applyActiveTools(pi, next);
 			updatePlanUi(ctx, next);
 
-			// Terminate the turn after a successful plan_write so automatic review runs
-			// at turn_end and the next turn sees a fresh, narrowed tool snapshot.
+			// Terminate only when a full plan was submitted for automatic review. Skeleton
+			// and patch writes are incremental authoring operations; keeping the turn alive
+			// lets the model continue patching or finish with mode:'full' on the same tool surface.
 			return {
 				content: [{ type: "text" as const, text: buildPlanWriteResult(next) }],
 				details: { state: next },
-				terminate: true,
+				terminate: next.reviewPending ? true as const : undefined,
 			};
 		},
 		renderCall(args, theme) {
@@ -791,17 +792,17 @@ function applyPlanWrite(current: PlanFlowState, params: PlanWriteInput): PlanFlo
 		});
 	}
 
-	const steps = normalizePlanWriteSteps(params.steps);
+	const steps = params.steps !== undefined ? normalizePlanWriteSteps(params.steps) : normalizePlanWriteSteps(current.steps as PlanWriteInput["steps"]);
 	assertMandatoryValidationCovered(current, steps);
 	return touch({
 		...current,
 		phase: "reviewing",
-		title: requirePlanWriteString(params.title, "title"),
-		background: requirePlanWriteString(params.background, "background"),
-		decisions: normalizeStringArray(params.decisions),
-		assumptions: normalizeStringArray(params.assumptions),
+		title: requirePlanWriteString(params.title ?? current.title, "title"),
+		background: requirePlanWriteString(params.background ?? current.background, "background"),
+		decisions: params.decisions !== undefined ? normalizeStringArray(params.decisions) : current.decisions,
+		assumptions: params.assumptions !== undefined ? normalizeStringArray(params.assumptions) : current.assumptions,
 		steps,
-		risks: normalizeStringArray(params.risks),
+		risks: params.risks !== undefined ? normalizeStringArray(params.risks) : current.risks,
 		reviewed: false,
 		reviewPending: true,
 		reviewSkipped: false,
@@ -1277,8 +1278,9 @@ function advancePhase(pi: ExtensionAPI, ctx: ExtensionContext, next: PlanFlowSta
  *
  * Accepts the same `ctx` shape as the `/plan` command handler (ExtensionCommandContext
  * extends ExtensionContext), and an optional pre-built `PlanningContext` so callers do
- * not need to write+consume a `--context` handoff file either. Programmatic callers such
- * as /ta-dev must pass `approvalMode: "auto"` explicitly; `/plan` passes `"ui"`.
+ * not need to write+consume a `--context` handoff file either. Programmatic callers must
+ * pass an explicit approval mode: interactive callers can pass `"ui"`; trusted headless
+ * callers can pass `"auto"`.
  */
 export interface StartPlanFlowOptions {
 	request: string;

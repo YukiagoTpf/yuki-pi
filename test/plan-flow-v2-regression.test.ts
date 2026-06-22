@@ -47,6 +47,8 @@ describe("plan-flow v2 integration guards", () => {
 		assert.match(source, /mode === "skeleton"/);
 		assert.match(source, /mode === "patch"/);
 		assert.match(source, /mode:'full' when ready for review/);
+		assert.match(source, /params\.steps !== undefined \? normalizePlanWriteSteps\(params\.steps\) : normalizePlanWriteSteps\(current\.steps/);
+		assert.match(source, /terminate: next\.reviewPending \? true as const : undefined/);
 	});
 
 	it("steers plan_write payloads to stay within an output budget", () => {
