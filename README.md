@@ -24,7 +24,7 @@ pi -e git:github.com/YukiagoTpf/yuki-pi
 - `extensions/yuki-statusline.ts` — concise Claude Code-style footer: path, git branch, model, and context progress bar.
 - `extensions/enable-grep.ts` — enables Pi's built-in `grep` tool.
 - `extensions/todo/index.ts` — standalone branch-safe `todo_write` / `todo_clear` / `todo_read` tools and `/todos` command.
-- `extensions/plan-flow/index.ts` — `/plan` workflow: read-only research, grilling, automatic review, approval via `plan_exit`, final plan file, and plan-owned todo seeding.
+- `extensions/plan-flow/index.ts` — `/plan` / plan-mode workflow: read-only research, `plan_write` draft authoring (full/skeleton/patch), `get_plan_mode_status` self-check, automatic review, approval, final plan file, and plan-owned todo seeding.
 
 ## Ask User Question
 
