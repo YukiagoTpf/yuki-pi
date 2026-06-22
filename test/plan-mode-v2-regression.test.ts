@@ -125,7 +125,7 @@ describe("plan-mode v2 integration guards", () => {
 	});
 
 	it("prints the full plan markdown to history and uses an inline select for approval", () => {
-		assert.match(source, /import \{ getMarkdownTheme, withFileMutationQueue \}/);
+		assert.match(source, /import \{[^}]*getMarkdownTheme[^}]*withFileMutationQueue[^}]*\}/);
 		assert.match(source, /import \{ Markdown, Text \}/);
 		assert.doesNotMatch(source, /matchesKey/);
 		assert.doesNotMatch(source, /truncateToWidth/);
@@ -152,5 +152,21 @@ describe("plan-mode v2 integration guards", () => {
 		assert.doesNotMatch(source, /ctx\.ui\.custom<ApprovalChoice/);
 		assert.doesNotMatch(source, /function mouseWheelDelta/);
 		assert.doesNotMatch(source, /APPROVAL_MOUSE_WHEEL_LINES/);
+	});
+
+	it("uses a bounded read-only plan-reviewer subagent for automatic review", () => {
+		assert.match(source, /PLAN_REVIEWER_AGENT_NAME = "plan-reviewer"/);
+		assert.match(source, /PLAN_REVIEWER_TIMEOUT_MS = 60_000/);
+		assert.match(source, /async function runPlanReviewerSubagent/);
+		assert.match(source, /await import\("\.\.\/\.\.\/pi-subagent\/runner\.ts"\)/);
+		assert.match(source, /agentName: PLAN_REVIEWER_AGENT_NAME/);
+		assert.match(source, /initialContext: "empty"/);
+		assert.match(source, /maxDepth: 1/);
+		assert.match(source, /preventCycles: true/);
+		assert.match(source, /subagentReviewUsed/);
+		assert.match(source, /if \(!reviewing\.subagentReviewUsed\)/);
+		assert.match(source, /plan-reviewer subagent failed or timed out; fell back to direct review/);
+		assert.match(source, /normalizeReviewFindings/);
+		assert.match(source, /evidence/);
 	});
 });

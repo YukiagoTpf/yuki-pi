@@ -1,13 +1,15 @@
 import { complete } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getMarkdownTheme, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme, parseFrontmatter, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createTodoState, makeTodoStateRecord, reconstructTodoStates } from "../todo/index.ts";
 import { PLAN_STATE_CUSTOM_TYPE, TODO_STATE_CUSTOM_TYPE } from "../shared/constants.ts";
 import { buildPlanModeStatus, checkMandatoryValidation, derivePlanModeSurface, getAllowedToolsForState as getAllowedToolsForPhase, getConvergenceKick, parsePlanCommandArgs, PLAN_STATUS_TOOL, stripPlanMutatingTools, slugify } from "../shared/plan-helpers.ts";
+import type { AgentConfig } from "../../pi-subagent/agents.ts";
 
 export { PLAN_STATE_CUSTOM_TYPE };
 
@@ -20,6 +22,8 @@ const PLAN_KICK_CUSTOM_TYPE = "yuki-plan-flow-kick";
 const PLAN_MODE_PROMPT_CUSTOM_TYPE = "yuki-plan-flow-mode-prompt";
 const PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE = "yuki-plan-flow-approval-preview";
 const PLAN_REVIEW_SUMMARY_CUSTOM_TYPE = "yuki-plan-flow-review-summary";
+const PLAN_REVIEWER_AGENT_NAME = "plan-reviewer";
+const PLAN_REVIEWER_TIMEOUT_MS = 60_000;
 const PLAN_WRITE_BUDGET_GUIDANCE = "Keep each plan_write call well below the model max output tokens (initial heuristic: 40%-60%). If the plan is large, first send a skeleton or concise stage-level plan: background 5-8 core lines, decisions short, each step a stage, validation <= 2 items per step.";
 
 type Phase = "idle" | "planning" | "reviewing" | "revising" | "awaiting_approval" | "executing" | "completed" | "aborted";
@@ -36,9 +40,27 @@ interface PlanStep {
 	dependsOn?: string[];
 }
 
+interface ReviewEvidence {
+	file?: string;
+	line?: number;
+	quote?: string;
+}
+
+interface ReviewIssue {
+	stepId?: string;
+	issue: string;
+	suggestion?: string;
+	evidence?: ReviewEvidence;
+}
+
+interface ReviewFinding extends ReviewIssue {
+	severity?: "critical" | "major" | "minor" | "nit";
+}
+
 interface ReviewFeedback {
 	summary: string;
-	blockingIssues: Array<{ stepId?: string; issue: string; suggestion?: string }>;
+	blockingIssues: ReviewIssue[];
+	findings?: ReviewFinding[];
 	risks?: string[];
 	missingValidation?: string[];
 	infraWarnings?: string[];
@@ -85,6 +107,7 @@ interface PlanFlowState {
 	reviewSkipped?: boolean;
 	reviewSkippedReason?: string;
 	reviewFeedback?: ReviewFeedback;
+	subagentReviewUsed?: boolean;
 	reviewRevisionAttempts: number;
 	reviewBlockingHistory: ReviewBlockingHistoryEntry[];
 	approved: boolean;
@@ -575,17 +598,71 @@ function buildPlanWriteResult(state: PlanFlowState): string {
 
 async function runAutomaticReview(ctx: ExtensionContext, state: PlanFlowState): Promise<PlanFlowState> {
 	const reviewing = touch({ ...state, phase: "reviewing" });
+
+	if (!reviewing.subagentReviewUsed) {
+		try {
+			const feedback = await runPlanReviewerSubagent(ctx, reviewing);
+			return applyReviewFeedback(reviewing, feedback, true);
+		} catch (error) {
+			const warning = `plan-reviewer subagent failed or timed out; fell back to direct review: ${String(error)}`;
+			const fallback = await runDirectCompleteReview(ctx, reviewing, [warning]);
+			if (fallback.kind === "skipped") return skipReview(reviewing, fallback.reason, true);
+			return applyReviewFeedback(reviewing, fallback.feedback, true);
+		}
+	}
+
+	const direct = await runDirectCompleteReview(ctx, reviewing);
+	if (direct.kind === "skipped") return skipReview(reviewing, direct.reason, reviewing.subagentReviewUsed ?? false);
+	return applyReviewFeedback(reviewing, direct.feedback, reviewing.subagentReviewUsed ?? false);
+}
+
+function applyReviewFeedback(reviewing: PlanFlowState, feedback: ReviewFeedback, subagentReviewUsed: boolean): PlanFlowState {
+	const hasBlocking = feedback.blockingIssues.length > 0;
+	const reviewRevisionAttempts = hasBlocking ? reviewing.reviewRevisionAttempts + 1 : reviewing.reviewRevisionAttempts;
+	const reviewBlockingHistory = hasBlocking ? [
+		...reviewing.reviewBlockingHistory,
+		{ attempt: reviewRevisionAttempts, reviewedAt: new Date().toISOString(), issues: feedback.blockingIssues },
+	] : reviewing.reviewBlockingHistory;
+	return touch({
+		...reviewing,
+		phase: hasBlocking ? "revising" : "awaiting_approval",
+		reviewed: !hasBlocking,
+		reviewPending: false,
+		reviewSkipped: false,
+		reviewSkippedReason: undefined,
+		reviewFeedback: feedback,
+		subagentReviewUsed,
+		reviewRevisionAttempts,
+		reviewBlockingHistory,
+	});
+}
+
+function skipReview(reviewing: PlanFlowState, reason: string, subagentReviewUsed: boolean): PlanFlowState {
+	return touch({
+		...reviewing,
+		phase: "awaiting_approval",
+		reviewPending: false,
+		reviewSkipped: true,
+		reviewSkippedReason: reason,
+		subagentReviewUsed,
+	});
+}
+
+type DirectReviewResult = { kind: "feedback"; feedback: ReviewFeedback } | { kind: "skipped"; reason: string };
+
+async function runDirectCompleteReview(ctx: ExtensionContext, state: PlanFlowState, infraWarnings: string[] = []): Promise<DirectReviewResult> {
 	const model = ctx.model;
-	if (!model) return touch({ ...reviewing, phase: "awaiting_approval", reviewPending: false, reviewSkipped: true, reviewSkippedReason: "No active model" });
+	if (!model) return { kind: "skipped", reason: "No active model" };
 
 	try {
 		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-		if (!auth.ok) return touch({ ...reviewing, phase: "awaiting_approval", reviewPending: false, reviewSkipped: true, reviewSkippedReason: auth.error });
-		if (!auth.apiKey) return touch({ ...reviewing, phase: "awaiting_approval", reviewPending: false, reviewSkipped: true, reviewSkippedReason: "No API key for active model" });
+		if (!auth.ok) return { kind: "skipped", reason: auth.error };
+		if (!auth.apiKey) return { kind: "skipped", reason: "No API key for active model" };
 
 		const controller = new AbortController();
 		const timeout = setTimeout(() => controller.abort(), 60_000);
-		ctx.signal?.addEventListener("abort", () => controller.abort(), { once: true });
+		const abortFromParent = () => controller.abort();
+		ctx.signal?.addEventListener("abort", abortFromParent, { once: true });
 		try {
 			const response = await complete(
 				model,
@@ -602,42 +679,92 @@ async function runAutomaticReview(ctx: ExtensionContext, state: PlanFlowState): 
 			);
 			const raw = response.content.filter((block): block is { type: "text"; text: string } => block.type === "text").map((block) => block.text).join("\n");
 			const feedback = parseReviewFeedback(raw);
-			const hasBlocking = feedback.blockingIssues.length > 0;
-			const reviewRevisionAttempts = hasBlocking ? reviewing.reviewRevisionAttempts + 1 : reviewing.reviewRevisionAttempts;
-			const reviewBlockingHistory = hasBlocking ? [
-				...reviewing.reviewBlockingHistory,
-				{ attempt: reviewRevisionAttempts, reviewedAt: new Date().toISOString(), issues: feedback.blockingIssues },
-			] : reviewing.reviewBlockingHistory;
-			return touch({
-				...reviewing,
-				phase: hasBlocking ? "revising" : "awaiting_approval",
-				reviewed: !hasBlocking,
-				reviewPending: false,
-				reviewSkipped: false,
-				reviewSkippedReason: undefined,
-				reviewFeedback: feedback,
-				reviewRevisionAttempts,
-				reviewBlockingHistory,
-			});
+			if (infraWarnings.length > 0) feedback.infraWarnings = [...infraWarnings, ...(feedback.infraWarnings ?? [])];
+			return { kind: "feedback", feedback };
 		} finally {
 			clearTimeout(timeout);
+			ctx.signal?.removeEventListener("abort", abortFromParent);
 		}
 	} catch (error) {
-		return touch({
-			...reviewing,
-			phase: "awaiting_approval",
-			reviewPending: false,
-			reviewSkipped: true,
-			reviewSkippedReason: String(error),
-		});
+		return { kind: "skipped", reason: String(error) };
 	}
+}
+
+async function runPlanReviewerSubagent(ctx: ExtensionContext, state: PlanFlowState): Promise<ReviewFeedback> {
+	const agent = await loadBundledPlanReviewerAgent();
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), PLAN_REVIEWER_TIMEOUT_MS);
+	const abortFromParent = () => controller.abort();
+	ctx.signal?.addEventListener("abort", abortFromParent, { once: true });
+	try {
+		const { runAgent } = await import("../../pi-subagent/runner.ts");
+		const result = await runAgent({
+			cwd: ctx.cwd,
+			agents: [agent],
+			callIndex: 0,
+			agentName: PLAN_REVIEWER_AGENT_NAME,
+			prompt: buildPlanReviewerPrompt(state),
+			callCwd: ctx.cwd,
+			initialContext: "empty",
+			parentDepth: 0,
+			parentAgentStack: [],
+			maxDepth: 1,
+			preventCycles: true,
+			signal: controller.signal,
+			makeDetails: (results) => ({ projectAgentsDir: null, results }),
+		});
+		if (result.exitCode !== 0) throw new Error(result.errorMessage || result.stderr || `plan-reviewer exited with ${result.exitCode}`);
+		const raw = getFinalAssistantText(result.messages) || result.stderr;
+		if (!raw.trim()) throw new Error("plan-reviewer returned no review output");
+		return parseReviewFeedback(raw);
+	} finally {
+		clearTimeout(timeout);
+		ctx.signal?.removeEventListener("abort", abortFromParent);
+	}
+}
+
+async function loadBundledPlanReviewerAgent(): Promise<AgentConfig> {
+	const filePath = resolve(dirname(fileURLToPath(import.meta.url)), "../../pi-subagent/agents/plan-reviewer.md");
+	const content = await readFile(filePath, "utf8");
+	const parsed = parseFrontmatter<Record<string, unknown>>(content);
+	const frontmatter = parsed.frontmatter ?? {};
+	const name = typeof frontmatter.name === "string" ? frontmatter.name.trim() : PLAN_REVIEWER_AGENT_NAME;
+	if (name !== PLAN_REVIEWER_AGENT_NAME) throw new Error(`Invalid bundled plan reviewer name: ${name}`);
+	return {
+		name,
+		description: typeof frontmatter.description === "string" ? frontmatter.description.trim() : "Review yuki plan drafts against the actual codebase. Read-only; never edit.",
+		tools: parseAgentTools(frontmatter.tools),
+		sessionPreference: frontmatter.sessionPreference === "ephemeral" || frontmatter.sessionPreference === "persistent" || frontmatter.sessionPreference === "either" ? frontmatter.sessionPreference : "ephemeral",
+		systemPrompt: parsed.body ?? "",
+		source: "project",
+		filePath,
+	};
+}
+
+function parseAgentTools(raw: unknown): string[] | undefined {
+	if (typeof raw === "string") return raw.split(",").map((tool) => tool.trim()).filter(Boolean);
+	if (Array.isArray(raw)) return raw.filter((tool): tool is string => typeof tool === "string").map((tool) => tool.trim()).filter(Boolean);
+	return undefined;
+}
+
+function buildPlanReviewerPrompt(state: PlanFlowState): string {
+	return [
+		"Review this yuki plan draft against repository facts.",
+		"Return strict JSON only, following the plan-reviewer system prompt contract.",
+		"Do not edit files or implement the plan.",
+		"",
+		"Plan draft:",
+		"```markdown",
+		renderPlanMarkdown(state),
+		"```",
+	].join("\n");
 }
 
 function buildReviewPrompt(state: PlanFlowState): string {
 	return [
 		"Review this implementation plan. Do not rewrite it.",
 		"Return strict JSON only with this shape:",
-		'{"summary":"...","blockingIssues":[{"stepId":"step-1","issue":"...","suggestion":"..."}],"risks":["..."],"missingValidation":["step-2"]}',
+		'{"summary":"...","blockingIssues":[{"stepId":"step-1","issue":"...","suggestion":"...","evidence":{"file":"path","line":1,"quote":"..."}}],"risks":["..."],"missingValidation":["step-2"]}',
 		"Only include blockingIssues for problems that would cause rework, unsafe changes, or an unexecutable plan.",
 		"Check specifically: unresolved implementation decisions, assumptions presented as facts, vague validation, missing mandatory validation, and steps too underspecified for another agent to execute.",
 		"If the plan is acceptable, return an empty blockingIssues array.",
@@ -650,14 +777,17 @@ function parseReviewFeedback(raw: string): ReviewFeedback {
 	const jsonText = raw.match(/```json\s*([\s\S]*?)```/i)?.[1] ?? raw.match(/\{[\s\S]*\}/)?.[0] ?? raw;
 	try {
 		const parsed = JSON.parse(jsonText) as Partial<ReviewFeedback>;
+		const findings = normalizeReviewFindings((parsed as { findings?: unknown }).findings);
+		const explicitBlocking = normalizeReviewIssues(parsed.blockingIssues);
+		const derivedBlocking = findings.filter((finding) => finding.severity === "critical" || finding.severity === "major").map(({ severity: _severity, ...issue }) => issue);
+		const risks = Array.isArray(parsed.risks) ? parsed.risks.filter((risk): risk is string => typeof risk === "string") : findings
+			.filter((finding) => finding.severity === "minor" || finding.severity === "nit")
+			.map((finding) => `${finding.severity ?? "minor"}: ${finding.issue}`);
 		return {
 			summary: typeof parsed.summary === "string" ? parsed.summary : "Review completed.",
-			blockingIssues: Array.isArray(parsed.blockingIssues) ? parsed.blockingIssues.filter((issue) => issue && typeof issue.issue === "string").map((issue) => ({
-				stepId: typeof issue.stepId === "string" ? issue.stepId : undefined,
-				issue: issue.issue,
-				suggestion: typeof issue.suggestion === "string" ? issue.suggestion : undefined,
-			})) : [],
-			risks: Array.isArray(parsed.risks) ? parsed.risks.filter((risk): risk is string => typeof risk === "string") : [],
+			blockingIssues: explicitBlocking.length > 0 ? explicitBlocking : derivedBlocking,
+			findings,
+			risks,
 			missingValidation: Array.isArray(parsed.missingValidation) ? parsed.missingValidation.filter((item): item is string => typeof item === "string") : [],
 			infraWarnings: Array.isArray(parsed.infraWarnings) ? parsed.infraWarnings.filter((item): item is string => typeof item === "string") : [],
 			raw,
@@ -670,6 +800,63 @@ function parseReviewFeedback(raw: string): ReviewFeedback {
 			raw,
 		};
 	}
+}
+
+function normalizeReviewIssues(value: unknown): ReviewIssue[] {
+	if (!Array.isArray(value)) return [];
+	return value.map(normalizeReviewIssue).filter((issue): issue is ReviewIssue => Boolean(issue));
+}
+
+function normalizeReviewIssue(value: unknown): ReviewIssue | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const issue = (value as { issue?: unknown }).issue;
+	if (typeof issue !== "string" || !issue.trim()) return undefined;
+	const rawEvidence = (value as { evidence?: unknown }).evidence;
+	return {
+		stepId: typeof (value as { stepId?: unknown }).stepId === "string" ? (value as { stepId: string }).stepId : undefined,
+		issue: issue.trim(),
+		suggestion: typeof (value as { suggestion?: unknown }).suggestion === "string" ? (value as { suggestion: string }).suggestion.trim() : undefined,
+		evidence: normalizeReviewEvidence(rawEvidence),
+	};
+}
+
+function normalizeReviewFindings(value: unknown): ReviewFinding[] {
+	if (!Array.isArray(value)) return [];
+	const findings: ReviewFinding[] = [];
+	for (const rawFinding of value) {
+		const issue = normalizeReviewIssue(rawFinding);
+		if (!issue) continue;
+		const severity = typeof (rawFinding as { severity?: unknown }).severity === "string" ? (rawFinding as { severity: string }).severity.toLowerCase() : undefined;
+		const finding: ReviewFinding = { ...issue };
+		if (severity === "critical" || severity === "major" || severity === "minor" || severity === "nit") finding.severity = severity;
+		findings.push(finding);
+	}
+	return findings;
+}
+
+function normalizeReviewEvidence(value: unknown): ReviewEvidence | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const file = typeof (value as { file?: unknown }).file === "string" ? (value as { file: string }).file.trim() : undefined;
+	const lineValue = (value as { line?: unknown }).line;
+	const line = typeof lineValue === "number" ? lineValue : typeof lineValue === "string" ? Number.parseInt(lineValue, 10) : undefined;
+	const quote = typeof (value as { quote?: unknown }).quote === "string" ? (value as { quote: string }).quote.trim() : undefined;
+	return file || line || quote ? { file, line: Number.isFinite(line) ? line : undefined, quote } : undefined;
+}
+
+function getFinalAssistantText(messages: unknown[]): string {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (!message || typeof message !== "object" || (message as { role?: unknown }).role !== "assistant") continue;
+		const content = (message as { content?: unknown }).content;
+		if (!Array.isArray(content)) continue;
+		for (const part of content) {
+			if (part && typeof part === "object" && (part as { type?: unknown }).type === "text") {
+				const text = (part as { text?: unknown }).text;
+				if (typeof text === "string" && text.trim()) return text;
+			}
+		}
+	}
+	return "";
 }
 
 /** Format review blocking issues for revising prompts and hidden next-turn content. */
