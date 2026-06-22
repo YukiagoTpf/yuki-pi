@@ -30,15 +30,15 @@ pi -e git:github.com/YukiagoTpf/yuki-pi
 
 The `ask_user_question` tool lets the model pause to ask one user-facing question, optionally with choices and an “Other” custom answer. When choices are shown, the custom answer is an inline input box (Claude Code-style), so typing a custom response no longer requires selecting “Other” first. Long question text is wrapped and capped, and only the selected option's description is shown to keep the dialog height stable during navigation. The selected answer is returned as the tool result so the model can continue with the user's decision in context.
 
-## Plan Flow
+## Plan Mode
 
-The plan-flow module provides:
+The plan-mode module provides:
 
 - `/plan [--context <token>] <request>` — enter read-only planning mode for a requested change. `--context <token>` loads structured planning constraints (profiles, mandatory validation, declared files) from a one-shot `.pi/plan-context/<token>.json` handoff file written by callers like `/ta-dev`, so constraints do not have to be serialized into the visible prompt.
-- `grill_plan`, `plan_ask`, `grill_done` — record and resolve at most five critical planning questions before drafting.
-- `plan_write` — write a structured plan draft and render `.pi/plan-draft-<planId>.md`. When a planning context declares mandatory validation, `plan_write` enforces that the union of all steps' `validation` covers every mandatory sensor.
-- Automatic review — after draft `plan_write`, the current model reviews the plan once; blocking issues return the flow to revision, otherwise the approval dialog opens automatically (no need to call `plan_exit` manually in interactive sessions).
-- `plan_exit` — request user approval (also used as the headless fallback); approval promotes the plan to `docs/plan-<slug>-<planId>.md` and seeds a plan-owned todo list, then automatically starts the execution turn.
+- `get_plan_mode_status` — read-only self-check for the current plan mode and available plan tools.
+- `plan_write` — write a structured plan draft and render `.pi/plan-draft-<planId>.md`. Use `mode:"skeleton"` for title+steps, `mode:"patch"` for incremental updates, and `mode:"full"` to submit the accumulated draft for review. When a planning context declares mandatory validation, full submission enforces that the union of all steps' `validation` covers every mandatory sensor.
+- Automatic review — after full `plan_write`, the current model reviews the plan once; blocking issues return the flow to revision, otherwise an approval dialog opens automatically in UI mode.
+- Approval promotes the plan to `docs/plan-<slug>-<planId>.md` and seeds a plan-owned todo list, then automatically starts the execution turn.
 - A plan auto-closes once all its plan-owned todos are completed, freeing `/plan` for a new run.
 - `/plan-status`, `/plan-debug` (phase / allowed tools / next action), and `/plan-abort`.
 
