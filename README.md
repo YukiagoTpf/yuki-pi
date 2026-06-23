@@ -21,6 +21,7 @@ pi -e git:github.com/YukiagoTpf/yuki-pi
 - `extensions/recap.ts` — `/recap` one-sentence session progress recap.
 - `extensions/yuki-compaction.ts` — structured long-session compaction with pruning, archives, pinned state, and proactive triggers.
 - `extensions/codex-usage-status.ts` — footer status for Codex/Codex Spark usage windows, adapted from `@calesennett/pi-codex-usage`.
+- `extensions/volcengine-agent-plan-usage-status.ts` — footer status for Volcengine Ark Agent Plan AFP quota windows.
 - `extensions/yuki-statusline.ts` — concise Claude Code-style footer: path, git branch, model, and context progress bar.
 - `extensions/enable-grep.ts` — enables Pi's built-in `grep` tool.
 - `extensions/todo/index.ts` — standalone branch-safe `todo_write` / `todo_clear` / `todo_read` tools and `/todos` command.
@@ -68,6 +69,19 @@ Commands:
 - `/codex-usage-reset-window 7d|5h` — set reset countdown window explicitly.
 
 Preferences are stored in Pi's `settings.json` under `pi-codex-usage`.
+
+## Volcengine Agent Plan Usage Status
+
+Shows Volcengine Ark Agent Plan AFP quota in the footer while an Agent Plan model is selected (for example the configured `volcengine/glm-5.2`). It calls `GetAFPUsage` and displays the 5h, daily, weekly, and monthly windows as remaining percentages with a compact used/quota hint, colored green/yellow/red by how close each window is to its limit.
+
+`GetAFPUsage` is a Volcengine control-plane API on the global OpenAPI gateway, so it requires Volcengine AK/SK signing (not a Bearer Ark API key). Credentials are read from `VOLC_ACCESSKEY` + `VOLC_SECRETKEY` env vars or `~/.volc/config`.
+
+Commands:
+
+- `/volcengine-agent-plan-usage-reset-window` — toggle reset countdown between `5h`, `daily`, `weekly`, and `monthly`.
+- `/volcengine-agent-plan-usage-reset-window 5h|daily|weekly|monthly` — set reset countdown window explicitly.
+
+Preferences are stored in Pi's `settings.json` under `pi-volcengine-agent-plan-usage`.
 
 ## Yuki Compaction
 
