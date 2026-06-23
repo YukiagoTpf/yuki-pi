@@ -52,7 +52,7 @@ export function formatStatus(ctx: ExtensionContext, usage: UsageSnapshot, prefer
 		.join(" ");
 	const focus = usage.windows[preferences.refreshWindow];
 	const reset = focus ? formatCountdownFromEpochMillis(focus.resetTime) : null;
-	const resetText = reset ? theme.fg("dim", ` (${windows[preferences.refreshWindow].label}↺${reset})`) : "";
+	const resetText = reset ? theme.fg("dim", ` (${windows[preferences.refreshWindow].label} reset ${reset})`) : "";
 	return `${theme.fg(usage.isLimited ? "error" : "dim", title(usage))} ${usageText}${resetText}`;
 }
 
