@@ -188,7 +188,7 @@ describe("plan-mode v2 integration guards", () => {
 
 	it("uses a bounded read-only plan-reviewer subagent for automatic review", () => {
 		assert.match(source, /PLAN_REVIEWER_AGENT_NAME = "plan-reviewer"/);
-		assert.match(source, /PLAN_REVIEWER_TIMEOUT_MS = 60_000/);
+		assert.match(source, /PLAN_REVIEWER_TIMEOUT_MS = 300_000/);
 		assert.match(source, /async function runPlanReviewerSubagent/);
 		assert.match(source, /await import\("\.\.\/\.\.\/pi-subagent\/runner\.ts"\)/);
 		assert.match(source, /agentName: PLAN_REVIEWER_AGENT_NAME/);

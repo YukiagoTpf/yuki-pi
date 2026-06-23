@@ -23,7 +23,7 @@ const PLAN_MODE_PROMPT_CUSTOM_TYPE = "yuki-plan-flow-mode-prompt";
 const PLAN_APPROVAL_PREVIEW_CUSTOM_TYPE = "yuki-plan-flow-approval-preview";
 const PLAN_REVIEW_SUMMARY_CUSTOM_TYPE = "yuki-plan-flow-review-summary";
 const PLAN_REVIEWER_AGENT_NAME = "plan-reviewer";
-const PLAN_REVIEWER_TIMEOUT_MS = 60_000;
+const PLAN_REVIEWER_TIMEOUT_MS = 300_000;
 const PLAN_WRITE_BUDGET_GUIDANCE = "Keep each plan_write call well below the model max output tokens (initial heuristic: 40%-60%). If the plan is large, first send a skeleton or concise stage-level plan: background 5-8 core lines, decisions short, each step a stage, validation <= 2 items per step.";
 
 type Phase = "idle" | "planning" | "reviewing" | "revising" | "awaiting_approval" | "executing" | "completed" | "aborted";
@@ -849,7 +849,10 @@ function parseAgentTools(raw: unknown): string[] | undefined {
 
 function buildPlanReviewerPrompt(state: PlanFlowState): string {
 	return [
-		"Review this yuki plan draft against repository facts.",
+		"Review this yuki plan draft using the self-grill workflow in your system prompt.",
+		"You are the only reviewer — there is no human to ask. For every question you raise, resolve it yourself by reading the codebase (read/grep/find/ls); report only what you cannot resolve.",
+		"Walk the full decision tree before writing output: inventory gray zones, verify every reference against the code, resolve cross-step dependencies, disambiguate terminology, and check cross-step naming/type consistency.",
+		"Do not stop at the first issue — exhaust the decision tree, then output.",
 		"Return strict JSON only, following the plan-reviewer system prompt contract.",
 		"Do not edit files or implement the plan.",
 		"",
@@ -862,12 +865,22 @@ function buildPlanReviewerPrompt(state: PlanFlowState): string {
 
 function buildReviewPrompt(state: PlanFlowState): string {
 	return [
-		"Review this implementation plan. Do not rewrite it.",
-		"Return strict JSON only with this shape:",
-		'{"summary":"...","blockingIssues":[{"stepId":"step-1","issue":"...","suggestion":"...","evidence":{"file":"path","line":1,"quote":"..."}}],"risks":["..."],"missingValidation":["step-2"]}',
-		"Only include blockingIssues for problems that would cause rework, unsafe changes, or an unexecutable plan.",
-		"Check specifically: unresolved implementation decisions, assumptions presented as facts, vague validation, missing mandatory validation, and steps too underspecified for another agent to execute.",
-		"If the plan is acceptable, return an empty blockingIssues array.",
+		"You are a relentless plan reviewer performing ONE strong review pass. You are the only reviewer — there is no human to ask, and you have NO tools to read the codebase. Reason from the plan text alone.",
+		"",
+		"Walk this self-grill workflow over the plan, resolving what you can by pure reasoning; report only what remains unresolved:",
+		"1. Inventory decisions and gray zones: list every decision the plan makes or implies, and every place a decision is missing, vague, deferred, or assumed (unspecified error handling, ordering, concurrency, unnamed APIs/types, vague validation, implicit invariants, steps too underspecified to execute without guessing).",
+		"2. Unverifiable references: the plan names files, APIs, tools, sensors, classes, commands, and types. You cannot verify them against the code. Flag any reference the plan does NOT explicitly mark as to-be-created — it is a finding because it may not exist or may be named differently.",
+		"3. Cross-step consistency: do types, method signatures, property names, file paths, and config keys introduced in one step match how later steps use them? A function called clearLayers() in step 3 but clearFullLayers() in step 7 is a bug.",
+		"4. Terminology: wherever a domain term is used, check the plan uses it consistently. If the same word could mean two different things, or two steps use it differently, surface the contradiction.",
+		"5. Assumptions and validation: every assumption must be explicit AND carry a reason (a bare 'opt-out' or 'assumed' with no justification is a finding). Every step that touches files must carry at least one validation entry naming a sensor + expected outcome; a file-touching step with no validation is a finding. Validation must be specific enough to run ('tests pass' is not).",
+		"6. Decision-tree interactions: for decisions that interact, construct the concrete scenario exercising both and check the plan defines the behavior. Unresolved interactions are findings.",
+		"",
+		"Calibration: only report issues that would cause real rework, unsafe changes, or an unexecutable plan. A requirement so ambiguous it could be built two different ways is a finding. Stylistic preferences are not.",
+		"",
+		"Return strict JSON only with this shape (do not wrap in Markdown):",
+		'{"summary":"...","findings":[{"severity":"critical|major|minor|nit","stepId":"step-1","issue":"...","suggestion":"...","evidence":{"file":"path","line":1,"quote":"..."}}],"blockingIssues":[{"stepId":"step-1","issue":"...","suggestion":"...","evidence":{"file":"path","line":1,"quote":"..."}}],"risks":["..."],"missingValidation":["step-2"]}',
+		"Mapping: critical and major findings must also appear in blockingIssues. minor and nit findings go in risks unless they identify missing validation. Every finding and blocking issue must include evidence with file, line, and quote (use the plan text as the quote when you cannot cite code).",
+		"If the plan is acceptable after your pass, return empty arrays.",
 		"",
 		renderPlanMarkdown(state),
 	].join("\n");
